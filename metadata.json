@@ -1,0 +1,10 @@
+{
+  "uuid": "service-pauser@yurij.de",
+  "name": "Service Pauser",
+  "description": "Pause configured background maintenance services from GNOME Quick Settings.",
+  "gettext-domain": "service-pauser",
+  "settings-schema": "org.gnome.shell.extensions.service-pauser",
+  "shell-version": ["46", "47", "48", "49"],
+  "url": "https://github.com/shell-extensions/service-pauser",
+  "version": 1
+}

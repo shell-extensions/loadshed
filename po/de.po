@@ -1,0 +1,135 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: service-pauser 1\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-07-10 10:35+0200\n"
+"PO-Revision-Date: 2026-07-10 10:35+0200\n"
+"Last-Translator: \n"
+"Language-Team: German\n"
+"Language: de\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Stop Load"
+msgstr "Last Stop"
+
+msgid "Loading"
+msgstr "Lädt"
+
+msgid "Background services"
+msgstr "Hintergrunddienste"
+
+msgid "Refresh"
+msgstr "Aktualisieren"
+
+msgid "Resume managed services"
+msgstr "Verwaltete Dienste fortsetzen"
+
+msgid "Setup help"
+msgstr "Einrichtungshilfe"
+
+msgid "Refreshing"
+msgstr "Aktualisiert"
+
+msgid "Pausing"
+msgstr "Pausiert"
+
+msgid "Resuming"
+msgstr "Läuft"
+
+msgid "Unknown error"
+msgstr "Unbekannter Fehler"
+
+msgid "Setup required"
+msgstr "Einrichtung erforderlich"
+
+msgid "Error"
+msgstr "Fehler"
+
+msgid "Service Pauser"
+msgstr "Service Pauser"
+
+msgid "Service Pauser setup required"
+msgstr "Service Pauser Einrichtung erforderlich"
+
+msgid ""
+"Run install.sh from the extension directory, then reload GNOME Shell or re-"
+"enable the extension."
+msgstr ""
+"Führe install.sh aus dem Erweiterungsordner aus, lade GNOME Shell neu oder "
+"aktiviere die Erweiterung erneut."
+
+msgid "No services configured"
+msgstr "Keine Dienste konfiguriert"
+
+msgid "1 paused"
+msgid_plural "%d paused"
+msgstr[0] "1 pausiert"
+msgstr[1] "%d pausiert"
+
+msgid "1 running"
+msgid_plural "%d running"
+msgstr[0] "1 läuft"
+msgstr[1] "%d laufen"
+
+msgid "Nothing running"
+msgstr "Nichts läuft"
+
+msgid "Partial error"
+msgstr "Teilweise Fehler"
+
+msgid "Unknown"
+msgstr "Unbekannt"
+
+msgid "Service frozen, timer stopped"
+msgstr "Dienst eingefroren, Timer gestoppt"
+
+msgid "Service frozen"
+msgstr "Dienst eingefroren"
+
+msgid "Timer stopped"
+msgstr "Timer gestoppt"
+
+msgid "Paused"
+msgstr "Pausiert"
+
+msgid "Frozen externally"
+msgstr "Extern eingefroren"
+
+msgid "Running"
+msgstr "Läuft"
+
+msgid "Timer active"
+msgstr "Timer aktiv"
+
+msgid "Not loaded"
+msgstr "Nicht geladen"
+
+msgid "Inactive"
+msgstr "Inaktiv"
+
+msgid "Helper command failed"
+msgstr "Helper-Befehl fehlgeschlagen"
+
+msgid "General"
+msgstr "Allgemein"
+
+msgid "Show Quick Settings toggle"
+msgstr "Schalter in Schnelleinstellungen anzeigen"
+
+msgid "Resume on extension disable"
+msgstr "Beim Deaktivieren der Erweiterung fortsetzen"
+
+msgid "Refresh interval (s)"
+msgstr "Aktualisierungsintervall (s)"
+
+msgid "System files"
+msgstr "Systemdateien"
+
+msgid "Helper"
+msgstr "Hilfsprogramm"
+
+msgid "Services"
+msgstr "Dienste"

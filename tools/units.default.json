@@ -1,0 +1,8 @@
+[
+  {
+    "id": "aide",
+    "label": "AIDE daily check",
+    "service": "dailyaidecheck.service",
+    "timer": "dailyaidecheck.timer"
+  }
+]

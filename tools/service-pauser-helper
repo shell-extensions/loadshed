@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+CONFIG_PATH = "/etc/service-pauser/units.json"
+STATE_DIR = "/run/service-pauser"
+STATE_PATH = f"{STATE_DIR}/state.json"
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+VALID_ID_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
+VALID_UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:\\-]+\.(service|timer)$")
+
+
+class ServicePauserError(Exception):
+    pass
+
+
+def json_print(payload):
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def fail(message, action="error"):
+    json_print({
+        "ok": False,
+        "action": action,
+        "paused": False,
+        "error": message,
+        "entries": [],
+        "errors": [message],
+    })
+    return 1
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise ServicePauserError("service-pauser-helper must run as root")
+
+
+def require_systemctl():
+    if shutil.which("systemctl") is None:
+        raise ServicePauserError("systemctl was not found")
+
+
+def validate_unit_name(unit, suffix):
+    if not isinstance(unit, str) or not VALID_UNIT_RE.match(unit):
+        raise ServicePauserError(f"invalid unit name: {unit!r}")
+    if not unit.endswith(suffix):
+        raise ServicePauserError(f"expected a {suffix} unit: {unit}")
+    return unit
+
+
+def validate_entry(raw, index):
+    if not isinstance(raw, dict):
+        raise ServicePauserError(f"unit entry #{index + 1} is not an object")
+
+    entry_id = raw.get("id")
+    label = raw.get("label")
+    service = raw.get("service")
+    timer = raw.get("timer")
+
+    if not isinstance(entry_id, str) or not VALID_ID_RE.match(entry_id):
+        raise ServicePauserError(f"invalid id in unit entry #{index + 1}")
+    if not isinstance(label, str) or not label.strip():
+        raise ServicePauserError(f"invalid label in unit entry {entry_id}")
+
+    service = validate_unit_name(service, ".service")
+    if timer is not None:
+        timer = validate_unit_name(timer, ".timer")
+
+    return {
+        "id": entry_id,
+        "label": label.strip(),
+        "service": service,
+        "timer": timer,
+    }
+
+
+def load_units():
+    try:
+        st = os.stat(CONFIG_PATH)
+    except FileNotFoundError as exc:
+        raise ServicePauserError(f"configuration missing: {CONFIG_PATH}") from exc
+
+    if st.st_uid != 0:
+        raise ServicePauserError(f"configuration must be owned by root: {CONFIG_PATH}")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ServicePauserError(f"configuration must not be group/world writable: {CONFIG_PATH}")
+
+    with open(CONFIG_PATH, "r", encoding="utf-8") as config_file:
+        raw_units = json.load(config_file)
+
+    if not isinstance(raw_units, list):
+        raise ServicePauserError("configuration root must be a JSON list")
+
+    units = [validate_entry(raw, index) for index, raw in enumerate(raw_units)]
+    seen = set()
+    for unit in units:
+        if unit["id"] in seen:
+            raise ServicePauserError(f"duplicate unit id: {unit['id']}")
+        seen.add(unit["id"])
+    return units
+
+
+def load_state():
+    try:
+        st = os.stat(STATE_PATH)
+    except FileNotFoundError:
+        return {"entries": {}}
+
+    if st.st_uid != 0 or (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+        return {"entries": {}}
+
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except (OSError, json.JSONDecodeError):
+        return {"entries": {}}
+
+    entries = state.get("entries")
+    if not isinstance(entries, dict):
+        return {"entries": {}}
+    return {"entries": entries}
+
+
+def save_state(state):
+    entries = state.get("entries", {})
+    if not entries:
+        try:
+            os.unlink(STATE_PATH)
+        except FileNotFoundError:
+            pass
+        return
+
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    state["updated_at"] = int(time.time())
+    tmp_path = f"{STATE_PATH}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as state_file:
+        json.dump(state, state_file, sort_keys=True, separators=(",", ":"))
+        state_file.write("\n")
+    os.chmod(tmp_path, 0o644)
+    os.replace(tmp_path, STATE_PATH)
+
+
+def systemctl(args, check=False):
+    result = subprocess.run(
+        ["systemctl", *args],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise ServicePauserError(f"systemctl {' '.join(args)} failed: {detail}")
+    return result
+
+
+def show_unit(unit, include_freezer=False, extra_properties=None):
+    properties = ["LoadState", "ActiveState", "SubState"]
+    if include_freezer:
+        properties.append("FreezerState")
+    if extra_properties:
+        properties.extend(extra_properties)
+
+    args = ["show", unit, "--no-pager"]
+    for prop in properties:
+        args.append(f"--property={prop}")
+
+    result = systemctl(args)
+    values = {prop: "unknown" for prop in properties}
+    if result.returncode != 0:
+        values["Error"] = result.stderr.strip() or result.stdout.strip()
+        return values
+
+    for line in result.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in values:
+            values[key] = value or "unknown"
+    return values
+
+
+def is_active(unit):
+    return show_unit(unit)["ActiveState"] in ("active", "activating")
+
+
+def cgroup_file_from_status(status, filename):
+    control_group = status.get("ControlGroup")
+    if not isinstance(control_group, str) or not control_group.startswith("/"):
+        raise ServicePauserError("unit control group is not available")
+
+    rel_path = control_group.lstrip("/")
+    cgroup_path = os.path.normpath(os.path.join(CGROUP_ROOT, rel_path))
+    cgroup_root = os.path.normpath(CGROUP_ROOT)
+    if cgroup_path == cgroup_root or not cgroup_path.startswith(f"{cgroup_root}/"):
+        raise ServicePauserError(f"refusing unexpected control group: {control_group}")
+
+    return os.path.join(cgroup_path, filename)
+
+
+def cgroup_frozen_from_status(status):
+    try:
+        events_path = cgroup_file_from_status(status, "cgroup.events")
+    except ServicePauserError:
+        return False
+
+    try:
+        with open(events_path, "r", encoding="utf-8") as events_file:
+            for line in events_file:
+                key, _, value = line.strip().partition(" ")
+                if key == "frozen":
+                    return value == "1"
+    except OSError:
+        return False
+
+    return False
+
+
+def set_cgroup_freeze(unit, frozen):
+    status = show_unit(unit, include_freezer=True, extra_properties=["ControlGroup"])
+    freeze_path = cgroup_file_from_status(status, "cgroup.freeze")
+    requested = "1" if frozen else "0"
+
+    try:
+        with open(freeze_path, "w", encoding="utf-8") as freeze_file:
+            freeze_file.write(f"{requested}\n")
+    except OSError as exc:
+        action = "freeze" if frozen else "thaw"
+        raise ServicePauserError(f"cgroup {action} failed for {unit}: {exc}") from exc
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if cgroup_frozen_from_status(status) == frozen:
+            return
+        time.sleep(0.05)
+
+    action = "freeze" if frozen else "thaw"
+    raise ServicePauserError(f"cgroup {action} timed out for {unit}")
+
+
+def freeze_service(unit):
+    result = systemctl(["freeze", unit])
+    if result.returncode == 0:
+        return "systemctl"
+
+    detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+    try:
+        set_cgroup_freeze(unit, True)
+    except ServicePauserError as exc:
+        raise ServicePauserError(
+            f"systemctl freeze {unit} failed: {detail}; fallback {exc}"
+        ) from exc
+
+    return "cgroup"
+
+
+def thaw_service(unit, method):
+    if method == "cgroup":
+        set_cgroup_freeze(unit, False)
+        return
+
+    systemctl(["thaw", unit], check=True)
+
+
+def pause_units(units):
+    state = load_state()
+    entries = state.setdefault("entries", {})
+    errors = []
+
+    for unit in units:
+        entry_state = entries.get(unit["id"], {
+            "service": unit["service"],
+            "timer": unit.get("timer"),
+            "service_frozen": False,
+            "timer_stopped": False,
+        })
+
+        try:
+            timer = unit.get("timer")
+            if timer and not entry_state.get("timer_stopped") and is_active(timer):
+                systemctl(["stop", timer], check=True)
+                entry_state["timer_stopped"] = True
+
+            service_status = show_unit(unit["service"], include_freezer=True, extra_properties=["ControlGroup"])
+            service_active = service_status["ActiveState"] in ("active", "activating")
+            service_frozen = (
+                service_status.get("FreezerState") == "frozen" or
+                cgroup_frozen_from_status(service_status)
+            )
+
+            if service_active and not service_frozen and not entry_state.get("service_frozen"):
+                entry_state["freeze_method"] = freeze_service(unit["service"])
+                entry_state["service_frozen"] = True
+        except ServicePauserError as exc:
+            errors.append(f"{unit['label']}: {exc}")
+
+        if entry_state.get("service_frozen") or entry_state.get("timer_stopped"):
+            entries[unit["id"]] = entry_state
+        else:
+            entries.pop(unit["id"], None)
+
+    save_state(state)
+    return errors
+
+
+def units_by_id(units):
+    return {unit["id"]: unit for unit in units}
+
+
+def state_unit_from_entry(entry_id, entry_state, configured):
+    if entry_id in configured:
+        return configured[entry_id]
+
+    service = validate_unit_name(entry_state.get("service"), ".service")
+    timer = entry_state.get("timer")
+    if timer is not None:
+        timer = validate_unit_name(timer, ".timer")
+
+    return {
+        "id": entry_id,
+        "label": entry_id,
+        "service": service,
+        "timer": timer,
+    }
+
+
+def resume_units(units):
+    state = load_state()
+    entries = state.get("entries", {})
+    configured = units_by_id(units)
+    remaining = {}
+    errors = []
+
+    for entry_id, entry_state in entries.items():
+        try:
+            unit = state_unit_from_entry(entry_id, entry_state, configured)
+        except ServicePauserError as exc:
+            errors.append(f"{entry_id}: {exc}")
+            remaining[entry_id] = entry_state
+            continue
+
+        keep_state = dict(entry_state)
+
+        if entry_state.get("service_frozen"):
+            try:
+                service_status = show_unit(unit["service"], include_freezer=True, extra_properties=["ControlGroup"])
+                service_frozen = (
+                    service_status.get("FreezerState") == "frozen" or
+                    cgroup_frozen_from_status(service_status)
+                )
+                if service_frozen:
+                    thaw_service(unit["service"], entry_state.get("freeze_method"))
+                keep_state["service_frozen"] = False
+                keep_state.pop("freeze_method", None)
+            except ServicePauserError as exc:
+                errors.append(f"{unit['label']}: {exc}")
+
+        if entry_state.get("timer_stopped") and unit.get("timer"):
+            try:
+                systemctl(["start", unit["timer"]], check=True)
+                keep_state["timer_stopped"] = False
+            except ServicePauserError as exc:
+                errors.append(f"{unit['label']}: {exc}")
+
+        if keep_state.get("service_frozen") or keep_state.get("timer_stopped"):
+            remaining[entry_id] = keep_state
+
+    save_state({"entries": remaining})
+    return errors
+
+
+def status_payload(units, action, errors=None):
+    state = load_state()
+    managed = state.get("entries", {})
+    entries = []
+    seen = set()
+
+    for unit in units:
+        entries.append(status_entry(unit, managed.get(unit["id"])))
+        seen.add(unit["id"])
+
+    for entry_id, entry_state in managed.items():
+        if entry_id in seen:
+            continue
+        try:
+            unit = state_unit_from_entry(entry_id, entry_state, {})
+            entries.append(status_entry(unit, entry_state))
+        except ServicePauserError as exc:
+            entries.append({
+                "id": entry_id,
+                "label": entry_id,
+                "service": entry_state.get("service", ""),
+                "timer": entry_state.get("timer"),
+                "managed": True,
+                "paused": True,
+                "error": str(exc),
+            })
+
+    paused_count = sum(1 for entry in entries if entry.get("paused"))
+    running_count = sum(1 for entry in entries if entry.get("service_active"))
+    errors = errors or []
+
+    return {
+        "ok": not errors,
+        "action": action,
+        "paused": paused_count > 0,
+        "paused_count": paused_count,
+        "running_count": running_count,
+        "entries": entries,
+        "errors": errors,
+    }
+
+
+def status_entry(unit, managed_state):
+    service_status = show_unit(unit["service"], include_freezer=True, extra_properties=["ControlGroup"])
+    timer_status = show_unit(unit["timer"]) if unit.get("timer") else {}
+    managed_state = managed_state or {}
+    service_active = service_status["ActiveState"] in ("active", "activating")
+    cgroup_frozen = cgroup_frozen_from_status(service_status)
+    service_frozen = service_status.get("FreezerState") == "frozen" or cgroup_frozen
+    timer_active = timer_status.get("ActiveState") == "active"
+    managed = bool(managed_state.get("service_frozen") or managed_state.get("timer_stopped"))
+
+    return {
+        "id": unit["id"],
+        "label": unit["label"],
+        "service": unit["service"],
+        "timer": unit.get("timer"),
+        "service_load_state": service_status.get("LoadState"),
+        "service_active_state": service_status.get("ActiveState"),
+        "service_sub_state": service_status.get("SubState"),
+        "service_freezer_state": service_status.get("FreezerState"),
+        "service_cgroup_frozen": cgroup_frozen,
+        "service_active": service_active,
+        "service_frozen": service_frozen,
+        "timer_active_state": timer_status.get("ActiveState"),
+        "timer_sub_state": timer_status.get("SubState"),
+        "timer_active": timer_active,
+        "managed": managed,
+        "paused": managed,
+        "managed_service_frozen": bool(managed_state.get("service_frozen")),
+        "managed_timer_stopped": bool(managed_state.get("timer_stopped")),
+        "freeze_method": managed_state.get("freeze_method"),
+        "external_frozen": service_frozen and not managed_state.get("service_frozen"),
+    }
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) == 2 else None
+    if action not in {"status", "pause", "resume", "toggle"}:
+        return fail("usage: service-pauser-helper status|pause|resume|toggle")
+
+    try:
+        require_root()
+        require_systemctl()
+        units = load_units()
+
+        errors = []
+        if action == "pause":
+            errors = pause_units(units)
+        elif action == "resume":
+            errors = resume_units(units)
+        elif action == "toggle":
+            if load_state().get("entries"):
+                errors = resume_units(units)
+                action = "resume"
+            else:
+                errors = pause_units(units)
+                action = "pause"
+
+        payload = status_payload(units, action, errors)
+        json_print(payload)
+        return 0 if payload["ok"] else 1
+    except (OSError, json.JSONDecodeError, ServicePauserError) as exc:
+        return fail(str(exc), action=action)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

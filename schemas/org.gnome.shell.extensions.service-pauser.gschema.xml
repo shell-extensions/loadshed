@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.service-pauser" path="/org/gnome/shell/extensions/service-pauser/">
+    <key name="show-quick-settings" type="b">
+      <default>true</default>
+      <summary>Show Quick Settings toggle</summary>
+      <description>Whether to show the Service Pauser toggle in GNOME Quick Settings.</description>
+    </key>
+    <key name="auto-resume-on-disable" type="b">
+      <default>true</default>
+      <summary>Resume services on disable</summary>
+      <description>Whether to resume managed paused services when the extension is disabled.</description>
+    </key>
+    <key name="refresh-interval" type="i">
+      <default>10</default>
+      <summary>Status refresh interval</summary>
+      <description>How often the extension refreshes service status, in seconds.</description>
+    </key>
+  </schema>
+</schemalist>
