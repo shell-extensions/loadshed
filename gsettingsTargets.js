@@ -112,6 +112,12 @@ export class GSettingsTargets {
             if (schema.get_key(key).get_value_type().dup_string() !== 'b') {
                 return null;
             }
+            if (!schema.get_path()) {
+                // Relocatable schemas have no fixed path and can't be bound
+                // via `settingsSchema` alone; skip silently instead of
+                // throwing on every reload.
+                return null;
+            }
             return new Gio.Settings({ settingsSchema: schema });
         } catch (error) {
             logError(error, `Service Pauser: failed to resolve ${schemaId}::${key}`);
