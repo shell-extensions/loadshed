@@ -11,6 +11,9 @@ const CONFIG_PATH = '/etc/service-pauser/units.json';
 const VALID_ID_RE = /^[A-Za-z0-9_.@:-]+$/;
 const VALID_SERVICE_RE = /^[A-Za-z0-9_.@:-]+\.service$/;
 const VALID_TIMER_RE = /^[A-Za-z0-9_.@:-]+\.timer$/;
+const VALID_APP_KIND_RE = /^(flatpak|snap)$/;
+const VALID_APP_ID_RE = /^[A-Za-z0-9_.@:-]+$/;
+const APP_TARGET_KINDS = ['flatpak', 'snap'];
 
 class HelperClient {
     _helperCommand(action) {
@@ -91,6 +94,23 @@ function targetSubtitle(entry, gettext) {
     return `${entry.schema} / ${entry.key}`;
 }
 
+function appTargetSubtitle(entry, gettext) {
+    if (!entry.kind || !entry.app_id) {
+        return gettext('No app target');
+    }
+
+    return `${entry.kind}: ${entry.app_id}`;
+}
+
+function appKindIndex(kind) {
+    const index = APP_TARGET_KINDS.indexOf(kind || 'flatpak');
+    return index >= 0 ? index : 0;
+}
+
+function appKindFromRow(row) {
+    return APP_TARGET_KINDS[row.selected] || 'flatpak';
+}
+
 const FOLDERSIZE_TARGET_PRESET = {
     id: 'foldersize',
     label: 'Folder size scan',
@@ -101,6 +121,15 @@ const FOLDERSIZE_TARGET_PRESET = {
     enabled: true,
     own_toggle_key: 'show-quick-settings',
     install_url: 'https://github.com/shell-extensions/foldersize/releases',
+};
+
+const SIGNAL_APP_PRESET = {
+    id: 'signal',
+    label: 'Signal',
+    kind: 'flatpak',
+    app_id: 'org.signal.Signal',
+    desktop_id: 'org.signal.Signal.desktop',
+    enabled: true,
 };
 
 export default class ServicePauserPrefs extends ExtensionPreferences {
@@ -114,6 +143,8 @@ export default class ServicePauserPrefs extends ExtensionPreferences {
         this._defaultStatusById = new Map();
         this._targets = [];
         this._targetRows = [];
+        this._appTargets = [];
+        this._appTargetRows = [];
         this._schemaSource = Gio.SettingsSchemaSource.get_default();
 
         const settings = this.getSettings(SCHEMA_ID);
@@ -160,6 +191,22 @@ export default class ServicePauserPrefs extends ExtensionPreferences {
         this._targetsListGroup = new Adw.PreferencesGroup({ title: this._('Configured switches') });
         page.add(this._targetsListGroup);
 
+        const appTargetsGroup = new Adw.PreferencesGroup({
+            title: this._('Desktop apps'),
+            description: this._('Stop Flatpak or Snap desktop apps together with the pause button. Snap daemons can be added as normal services.'),
+        });
+        page.add(appTargetsGroup);
+
+        this._appTargetsMessageRow = new Adw.ActionRow({
+            title: this._('Desktop apps'),
+            subtitle: 'app-targets',
+        });
+        appTargetsGroup.add(this._appTargetsMessageRow);
+        appTargetsGroup.add(this._appTargetsControlRow());
+
+        this._appTargetsListGroup = new Adw.PreferencesGroup({ title: this._('Configured desktop apps') });
+        page.add(this._appTargetsListGroup);
+
         const pathsGroup = new Adw.PreferencesGroup({ title: this._('System files') });
         page.add(pathsGroup);
         pathsGroup.add(this._infoRow(this._('Helper'), HELPER_INSTALL_PATH));
@@ -168,6 +215,7 @@ export default class ServicePauserPrefs extends ExtensionPreferences {
         window.set_default_size(680, 620);
         this._loadConfig();
         this._loadTargets();
+        this._loadAppTargets();
     }
 
     _controlRow() {
@@ -203,6 +251,15 @@ export default class ServicePauserPrefs extends ExtensionPreferences {
         button.add_css_class('flat');
         button.connect('clicked', callback);
         return button;
+    }
+
+    _listActionRow(title, iconName, tooltipText, callback) {
+        const row = new Adw.ActionRow({ title });
+        const button = this._iconButton(iconName, tooltipText, callback);
+
+        row.add_suffix(button);
+        row.activatable_widget = button;
+        return row;
     }
 
     _loadDefaultEntries() {
@@ -358,63 +415,71 @@ export default class ServicePauserPrefs extends ExtensionPreferences {
             });
             this._servicesListGroup.add(emptyRow);
             this._serviceRows.push({ row: emptyRow });
-            return;
+        } else {
+            this._entries.forEach((entry, index) => {
+                const row = new Adw.ExpanderRow({
+                    title: entry.label || this._('Unnamed service'),
+                    subtitle: unitSubtitle(entry, this._),
+                });
+                const labelRow = new Adw.EntryRow({
+                    title: this._('Label'),
+                    text: entry.label || '',
+                });
+                const serviceRow = new Adw.EntryRow({
+                    title: this._('Service unit'),
+                    text: entry.service || '',
+                });
+                const timerRow = new Adw.EntryRow({
+                    title: this._('Timer unit (optional)'),
+                    text: entry.timer || '',
+                });
+                const enabledRow = new Adw.ActionRow({
+                    title: this._('Use with pause button'),
+                    subtitle: this._entryAvailabilitySubtitle(entry),
+                });
+                const enabledSwitch = new Gtk.Switch({
+                    active: entry.enabled !== false,
+                    valign: Gtk.Align.CENTER,
+                });
+                const removeRow = new Adw.ActionRow({ title: this._('Remove service') });
+                const removeButton = this._iconButton('user-trash-symbolic', this._('Remove service'), () => this._removeEntry(index));
+
+                enabledRow.add_suffix(enabledSwitch);
+                enabledRow.activatable_widget = enabledSwitch;
+                removeRow.add_suffix(removeButton);
+                removeRow.activatable_widget = removeButton;
+                row.add_row(labelRow);
+                row.add_row(serviceRow);
+                row.add_row(timerRow);
+                row.add_row(enabledRow);
+                row.add_row(removeRow);
+
+                const controls = { row, labelRow, serviceRow, timerRow, enabledSwitch, entry };
+                const syncTitle = () => {
+                    row.title = labelRow.text.trim() || this._('Unnamed service');
+                    row.subtitle = unitSubtitle({
+                        service: serviceRow.text.trim(),
+                        timer: timerRow.text.trim(),
+                    }, this._);
+                };
+
+                labelRow.connect('changed', syncTitle);
+                serviceRow.connect('changed', syncTitle);
+                timerRow.connect('changed', syncTitle);
+
+                this._servicesListGroup.add(row);
+                this._serviceRows.push(controls);
+            });
         }
 
-        this._entries.forEach((entry, index) => {
-            const row = new Adw.ExpanderRow({
-                title: entry.label || this._('Unnamed service'),
-                subtitle: unitSubtitle(entry, this._),
-            });
-            const labelRow = new Adw.EntryRow({
-                title: this._('Label'),
-                text: entry.label || '',
-            });
-            const serviceRow = new Adw.EntryRow({
-                title: this._('Service unit'),
-                text: entry.service || '',
-            });
-            const timerRow = new Adw.EntryRow({
-                title: this._('Timer unit (optional)'),
-                text: entry.timer || '',
-            });
-            const enabledRow = new Adw.ActionRow({
-                title: this._('Use with pause button'),
-                subtitle: this._entryAvailabilitySubtitle(entry),
-            });
-            const enabledSwitch = new Gtk.Switch({
-                active: entry.enabled !== false,
-                valign: Gtk.Align.CENTER,
-            });
-            const removeRow = new Adw.ActionRow({ title: this._('Remove service') });
-            const removeButton = this._iconButton('user-trash-symbolic', this._('Remove service'), () => this._removeEntry(index));
-
-            enabledRow.add_suffix(enabledSwitch);
-            enabledRow.activatable_widget = enabledSwitch;
-            removeRow.add_suffix(removeButton);
-            removeRow.activatable_widget = removeButton;
-            row.add_row(labelRow);
-            row.add_row(serviceRow);
-            row.add_row(timerRow);
-            row.add_row(enabledRow);
-            row.add_row(removeRow);
-
-            const controls = { row, labelRow, serviceRow, timerRow, enabledSwitch, entry };
-            const syncTitle = () => {
-                row.title = labelRow.text.trim() || this._('Unnamed service');
-                row.subtitle = unitSubtitle({
-                    service: serviceRow.text.trim(),
-                    timer: timerRow.text.trim(),
-                }, this._);
-            };
-
-            labelRow.connect('changed', syncTitle);
-            serviceRow.connect('changed', syncTitle);
-            timerRow.connect('changed', syncTitle);
-
-            this._servicesListGroup.add(row);
-            this._serviceRows.push(controls);
-        });
+        const addRow = this._listActionRow(
+            this._('Add service'),
+            'list-add-symbolic',
+            this._('Add service'),
+            () => this._addEntry()
+        );
+        this._servicesListGroup.add(addRow);
+        this._serviceRows.push({ row: addRow });
     }
 
     _rawEntriesFromRows() {
@@ -568,6 +633,295 @@ export default class ServicePauserPrefs extends ExtensionPreferences {
         return new Adw.ActionRow({ title, subtitle });
     }
 
+    _appTargetsControlRow() {
+        const row = new Adw.ActionRow({
+            title: this._('Desktop app configuration'),
+            subtitle: this._('Applied in the user session, no privileged helper needed.'),
+        });
+        const box = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 6,
+            valign: Gtk.Align.CENTER,
+        });
+
+        this._addAppTargetButton = this._iconButton('list-add-symbolic', this._('Add desktop app'), () => this._addAppTarget());
+        this._restoreSignalButton = this._iconButton('document-revert-symbolic', this._('Restore Signal default'), () => this._restoreSignalDefault());
+        this._reloadAppTargetsButton = this._iconButton('view-refresh-symbolic', this._('Reload desktop apps'), () => this._loadAppTargets());
+        this._saveAppTargetsButton = this._iconButton('document-save-symbolic', this._('Save desktop apps'), () => this._saveAppTargets());
+
+        box.append(this._addAppTargetButton);
+        box.append(this._restoreSignalButton);
+        box.append(this._reloadAppTargetsButton);
+        box.append(this._saveAppTargetsButton);
+        row.add_suffix(box);
+        return row;
+    }
+
+    _setAppTargetsMessage(title, subtitle = '') {
+        this._appTargetsMessageRow.title = title;
+        this._appTargetsMessageRow.subtitle = subtitle;
+    }
+
+    _loadAppTargets() {
+        try {
+            const raw = this._settings.get_string('app-targets');
+            const parsed = JSON.parse(raw);
+            this._appTargets = Array.isArray(parsed) ? parsed : [];
+            this._setAppTargetsMessage(this._('Desktop apps loaded'), 'app-targets');
+        } catch (error) {
+            logError(error, 'Service Pauser: failed to parse app-targets');
+            this._appTargets = [];
+            this._setAppTargetsMessage(this._('Failed to load desktop apps'), error.message || this._('Unknown error'));
+        }
+
+        this._rebuildAppTargetRows();
+    }
+
+    _saveAppTargets() {
+        const { entries, errors } = this._collectAppTargets();
+        if (errors.length > 0) {
+            this._setAppTargetsMessage(this._('Fix desktop apps'), errors.join('\n'));
+            return;
+        }
+
+        this._settings.set_string('app-targets', JSON.stringify(entries));
+        this._appTargets = entries;
+        this._rebuildAppTargetRows();
+        this._setAppTargetsMessage(this._('Desktop apps saved'), 'app-targets');
+    }
+
+    _addAppTarget() {
+        this._appTargets = this._rawAppTargetsFromRows();
+        this._appTargets.push({
+            id: '',
+            label: '',
+            kind: 'flatpak',
+            app_id: '',
+            desktop_id: '',
+            command: '',
+            enabled: true,
+        });
+        this._rebuildAppTargetRows();
+        this._setAppTargetsMessage(this._('Desktop app added'), this._('Fill in the new row, then save.'));
+    }
+
+    _removeAppTarget(index) {
+        this._appTargets = this._rawAppTargetsFromRows().filter((entry, entryIndex) => entryIndex !== index);
+        this._rebuildAppTargetRows();
+        this._setAppTargetsMessage(this._('Desktop app removed'), this._('Save desktop apps to apply this change.'));
+    }
+
+    _restoreSignalDefault() {
+        const entries = this._rawAppTargetsFromRows();
+        const existingIndex = entries.findIndex(entry =>
+            entry.kind === SIGNAL_APP_PRESET.kind && entry.app_id === SIGNAL_APP_PRESET.app_id);
+
+        if (existingIndex >= 0) {
+            entries[existingIndex] = {
+                ...entries[existingIndex],
+                ...SIGNAL_APP_PRESET,
+                id: entries[existingIndex].id || SIGNAL_APP_PRESET.id,
+            };
+            this._setAppTargetsMessage(this._('Signal default updated'), this._('Save desktop apps to apply this change.'));
+        } else {
+            entries.push({ ...SIGNAL_APP_PRESET });
+            this._setAppTargetsMessage(this._('Signal default added'), this._('Save desktop apps to apply this change.'));
+        }
+
+        this._appTargets = entries;
+        this._rebuildAppTargetRows();
+    }
+
+    _rebuildAppTargetRows() {
+        this._appTargetRows.forEach(controls => {
+            this._appTargetsListGroup.remove(controls.row);
+        });
+        this._appTargetRows = [];
+
+        if (this._appTargets.length === 0) {
+            const emptyRow = new Adw.ActionRow({
+                title: this._('No desktop apps configured'),
+                subtitle: this._('Add an app or restore the Signal default.'),
+            });
+            this._appTargetsListGroup.add(emptyRow);
+            this._appTargetRows.push({ row: emptyRow });
+        } else {
+            this._appTargets.forEach((entry, index) => {
+                const row = new Adw.ExpanderRow({
+                    title: entry.label || this._('Unnamed desktop app'),
+                    subtitle: appTargetSubtitle(entry, this._),
+                });
+
+                const labelRow = new Adw.EntryRow({ title: this._('Label'), text: entry.label || '' });
+                const kindRow = new Adw.ComboRow({
+                    title: this._('Kind (flatpak or snap)'),
+                    model: Gtk.StringList.new(APP_TARGET_KINDS),
+                    selected: appKindIndex(entry.kind),
+                });
+                const appIdRow = new Adw.EntryRow({ title: this._('App id'), text: entry.app_id || '' });
+                const desktopIdRow = new Adw.EntryRow({
+                    title: this._('Desktop id (optional)'),
+                    text: entry.desktop_id || '',
+                });
+                const commandRow = new Adw.EntryRow({
+                    title: this._('Start command (optional)'),
+                    text: entry.command || '',
+                });
+                const enabledRow = new Adw.ActionRow({
+                    title: this._('Use with pause button'),
+                    subtitle: this._('Flatpak uses flatpak kill; Snap apps use process matching.'),
+                });
+                const enabledSwitch = new Gtk.Switch({ active: entry.enabled !== false, valign: Gtk.Align.CENTER });
+                const removeRow = new Adw.ActionRow({ title: this._('Remove desktop app') });
+                const removeButton = this._iconButton('user-trash-symbolic', this._('Remove desktop app'), () => this._removeAppTarget(index));
+
+                enabledRow.add_suffix(enabledSwitch);
+                enabledRow.activatable_widget = enabledSwitch;
+                removeRow.add_suffix(removeButton);
+                removeRow.activatable_widget = removeButton;
+
+                row.add_row(labelRow);
+                row.add_row(kindRow);
+                row.add_row(appIdRow);
+                row.add_row(desktopIdRow);
+                row.add_row(commandRow);
+                row.add_row(enabledRow);
+                row.add_row(removeRow);
+
+                const controls = { row, labelRow, kindRow, appIdRow, desktopIdRow, commandRow, enabledSwitch, entry };
+                const syncTitle = () => {
+                    row.title = labelRow.text.trim() || this._('Unnamed desktop app');
+                    row.subtitle = appTargetSubtitle({
+                        kind: appKindFromRow(kindRow),
+                        app_id: appIdRow.text.trim(),
+                    }, this._);
+                };
+
+                labelRow.connect('changed', syncTitle);
+                kindRow.connect('notify::selected', syncTitle);
+                appIdRow.connect('changed', syncTitle);
+
+                this._appTargetsListGroup.add(row);
+                this._appTargetRows.push(controls);
+            });
+        }
+
+        const addRow = this._listActionRow(
+            this._('Add desktop app'),
+            'list-add-symbolic',
+            this._('Add desktop app'),
+            () => this._addAppTarget()
+        );
+        this._appTargetsListGroup.add(addRow);
+        this._appTargetRows.push({ row: addRow });
+    }
+
+    _rawAppTargetsFromRows() {
+        return this._appTargetRows
+            .filter(controls => controls.labelRow)
+            .map(controls => {
+                const entry = {
+                    id: controls.entry.id || '',
+                    label: controls.labelRow.text.trim(),
+                    kind: appKindFromRow(controls.kindRow),
+                    app_id: controls.appIdRow.text.trim(),
+                    enabled: controls.enabledSwitch?.active ?? true,
+                };
+
+                const command = controls.commandRow.text.trim();
+                if (command) {
+                    entry.command = command;
+                }
+                const desktopId = controls.desktopIdRow.text.trim();
+                if (desktopId) {
+                    entry.desktop_id = desktopId;
+                }
+
+                return entry;
+            });
+    }
+
+    _collectAppTargets() {
+        const errors = [];
+        const entries = [];
+        const usedIds = new Set();
+        const seenApps = new Set();
+
+        this._appTargetRows
+            .filter(controls => controls.labelRow)
+            .forEach((controls, index) => {
+                const label = controls.labelRow.text.trim();
+                const kind = appKindFromRow(controls.kindRow);
+                const appId = controls.appIdRow.text.trim();
+                const desktopId = controls.desktopIdRow.text.trim();
+                const command = controls.commandRow.text.trim();
+                const rowName = label || appId || `${this._('Desktop app')} ${index + 1}`;
+
+                if (!label && !appId && !command) {
+                    return;
+                }
+                if (!label) {
+                    errors.push(`${this._('Label is required')}: ${rowName}`);
+                }
+                if (!VALID_APP_KIND_RE.test(kind)) {
+                    errors.push(`${this._('Kind must be flatpak or snap')}: ${rowName}`);
+                }
+                if (!appId) {
+                    errors.push(`${this._('App id is required')}: ${rowName}`);
+                } else if (!VALID_APP_ID_RE.test(appId)) {
+                    errors.push(`${this._('Invalid app id')}: ${appId}`);
+                }
+                const appIdentity = `${kind}\u0000${appId}`;
+                if (kind && appId && seenApps.has(appIdentity)) {
+                    errors.push(`${this._('Duplicate desktop app')}: ${kind}: ${appId}`);
+                }
+
+                if (!label || !VALID_APP_KIND_RE.test(kind) || !appId || !VALID_APP_ID_RE.test(appId) || seenApps.has(appIdentity)) {
+                    return;
+                }
+
+                seenApps.add(appIdentity);
+                const id = this._appTargetId(controls.entry, kind, appId, usedIds);
+                const entry = {
+                    id,
+                    label,
+                    kind,
+                    app_id: appId,
+                    enabled: controls.enabledSwitch.active,
+                };
+
+                if (command) {
+                    entry.command = command;
+                }
+                if (desktopId) {
+                    entry.desktop_id = desktopId;
+                }
+
+                entries.push(entry);
+            });
+
+        return { entries, errors };
+    }
+
+    _appTargetId(sourceEntry, kind, appId, usedIds) {
+        let base = sourceEntry.id && VALID_ID_RE.test(sourceEntry.id) ? sourceEntry.id : '';
+        if (!base) {
+            base = `${kind}-${appId}`
+                .replace(/[^A-Za-z0-9_.@:-]+/g, '-')
+                .replace(/^-+|-+$/g, '') || 'app';
+        }
+
+        let id = base;
+        let counter = 2;
+        while (usedIds.has(id)) {
+            id = `${base}-${counter}`;
+            counter += 1;
+        }
+
+        usedIds.add(id);
+        return id;
+    }
+
     _targetsControlRow() {
         const row = new Adw.ActionRow({
             title: this._('Switch configuration'),
@@ -704,79 +1058,87 @@ export default class ServicePauserPrefs extends ExtensionPreferences {
             });
             this._targetsListGroup.add(emptyRow);
             this._targetRows.push({ row: emptyRow });
-            return;
+        } else {
+            this._targets.forEach((entry, index) => {
+                const row = new Adw.ExpanderRow({
+                    title: entry.label || this._('Unnamed switch'),
+                    subtitle: targetSubtitle(entry, this._),
+                });
+
+                const labelRow = new Adw.EntryRow({ title: this._('Label'), text: entry.label || '' });
+                const schemaRow = new Adw.EntryRow({ title: this._('Schema id'), text: entry.schema || '' });
+                const keyRow = new Adw.EntryRow({ title: this._('Key'), text: entry.key || '' });
+                const ownToggleRow = new Adw.EntryRow({
+                    title: this._('Hide own toggle key (optional)'),
+                    text: entry.own_toggle_key || '',
+                });
+                const extensionUuidRow = new Adw.EntryRow({
+                    title: this._('Extension UUID (optional, for non-system-wide schemas)'),
+                    text: entry.extension_uuid || '',
+                });
+
+                const pauseRow = new Adw.ActionRow({ title: this._('Value while paused') });
+                const pauseSwitch = new Gtk.Switch({ active: Boolean(entry.pause_value), valign: Gtk.Align.CENTER });
+                pauseRow.add_suffix(pauseSwitch);
+                pauseRow.activatable_widget = pauseSwitch;
+
+                const enabledRow = new Adw.ActionRow({
+                    title: this._('Use with pause button'),
+                    subtitle: this._targetAvailabilitySubtitle(entry),
+                });
+                const enabledSwitch = new Gtk.Switch({ active: entry.enabled !== false, valign: Gtk.Align.CENTER });
+                enabledRow.add_suffix(enabledSwitch);
+                enabledRow.activatable_widget = enabledSwitch;
+
+                if (!this._resolveSchema(entry.schema, entry.extension_uuid) && entry.install_url) {
+                    const linkButton = new Gtk.LinkButton({
+                        label: this._('Get extension'),
+                        uri: entry.install_url,
+                        valign: Gtk.Align.CENTER,
+                    });
+                    enabledRow.add_suffix(linkButton);
+                }
+
+                const removeRow = new Adw.ActionRow({ title: this._('Remove switch') });
+                const removeButton = this._iconButton('user-trash-symbolic', this._('Remove switch'), () => this._removeTarget(index));
+                removeRow.add_suffix(removeButton);
+                removeRow.activatable_widget = removeButton;
+
+                row.add_row(labelRow);
+                row.add_row(schemaRow);
+                row.add_row(keyRow);
+                row.add_row(extensionUuidRow);
+                row.add_row(ownToggleRow);
+                row.add_row(pauseRow);
+                row.add_row(enabledRow);
+                row.add_row(removeRow);
+
+                const controls = { row, labelRow, schemaRow, keyRow, ownToggleRow, extensionUuidRow, pauseSwitch, enabledSwitch, entry };
+                const syncTitle = () => {
+                    row.title = labelRow.text.trim() || this._('Unnamed switch');
+                    row.subtitle = targetSubtitle({
+                        schema: schemaRow.text.trim(),
+                        key: keyRow.text.trim(),
+                    }, this._);
+                };
+
+                labelRow.connect('changed', syncTitle);
+                schemaRow.connect('changed', syncTitle);
+                keyRow.connect('changed', syncTitle);
+
+                this._targetsListGroup.add(row);
+                this._targetRows.push(controls);
+            });
         }
 
-        this._targets.forEach((entry, index) => {
-            const row = new Adw.ExpanderRow({
-                title: entry.label || this._('Unnamed switch'),
-                subtitle: targetSubtitle(entry, this._),
-            });
-
-            const labelRow = new Adw.EntryRow({ title: this._('Label'), text: entry.label || '' });
-            const schemaRow = new Adw.EntryRow({ title: this._('Schema id'), text: entry.schema || '' });
-            const keyRow = new Adw.EntryRow({ title: this._('Key'), text: entry.key || '' });
-            const ownToggleRow = new Adw.EntryRow({
-                title: this._('Hide own toggle key (optional)'),
-                text: entry.own_toggle_key || '',
-            });
-            const extensionUuidRow = new Adw.EntryRow({
-                title: this._('Extension UUID (optional, for non-system-wide schemas)'),
-                text: entry.extension_uuid || '',
-            });
-
-            const pauseRow = new Adw.ActionRow({ title: this._('Value while paused') });
-            const pauseSwitch = new Gtk.Switch({ active: Boolean(entry.pause_value), valign: Gtk.Align.CENTER });
-            pauseRow.add_suffix(pauseSwitch);
-            pauseRow.activatable_widget = pauseSwitch;
-
-            const enabledRow = new Adw.ActionRow({
-                title: this._('Use with pause button'),
-                subtitle: this._targetAvailabilitySubtitle(entry),
-            });
-            const enabledSwitch = new Gtk.Switch({ active: entry.enabled !== false, valign: Gtk.Align.CENTER });
-            enabledRow.add_suffix(enabledSwitch);
-            enabledRow.activatable_widget = enabledSwitch;
-
-            if (!this._resolveSchema(entry.schema, entry.extension_uuid) && entry.install_url) {
-                const linkButton = new Gtk.LinkButton({
-                    label: this._('Get extension'),
-                    uri: entry.install_url,
-                    valign: Gtk.Align.CENTER,
-                });
-                enabledRow.add_suffix(linkButton);
-            }
-
-            const removeRow = new Adw.ActionRow({ title: this._('Remove switch') });
-            const removeButton = this._iconButton('user-trash-symbolic', this._('Remove switch'), () => this._removeTarget(index));
-            removeRow.add_suffix(removeButton);
-            removeRow.activatable_widget = removeButton;
-
-            row.add_row(labelRow);
-            row.add_row(schemaRow);
-            row.add_row(keyRow);
-            row.add_row(extensionUuidRow);
-            row.add_row(ownToggleRow);
-            row.add_row(pauseRow);
-            row.add_row(enabledRow);
-            row.add_row(removeRow);
-
-            const controls = { row, labelRow, schemaRow, keyRow, ownToggleRow, extensionUuidRow, pauseSwitch, enabledSwitch, entry };
-            const syncTitle = () => {
-                row.title = labelRow.text.trim() || this._('Unnamed switch');
-                row.subtitle = targetSubtitle({
-                    schema: schemaRow.text.trim(),
-                    key: keyRow.text.trim(),
-                }, this._);
-            };
-
-            labelRow.connect('changed', syncTitle);
-            schemaRow.connect('changed', syncTitle);
-            keyRow.connect('changed', syncTitle);
-
-            this._targetsListGroup.add(row);
-            this._targetRows.push(controls);
-        });
+        const addRow = this._listActionRow(
+            this._('Add switch'),
+            'list-add-symbolic',
+            this._('Add switch'),
+            () => this._addTarget()
+        );
+        this._targetsListGroup.add(addRow);
+        this._targetRows.push({ row: addRow });
     }
 
     _rawTargetsFromRows() {

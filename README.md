@@ -57,6 +57,10 @@ visible in the menu. Entry format:
 ]
 ```
 
+Snap daemons are normal systemd units and can be added here too. For example,
+Snap usually exposes a daemon as `snap.<snap-name>.<service-name>.service`.
+Use the exact unit name shown by systemd/snap for that daemon.
+
 ## GSettings switches
 
 Not everything worth pausing is a systemd unit. The [Folder Size](https://github.com/shell-extensions/foldersize)
@@ -91,6 +95,32 @@ Folder Size's "Scan on/off"), that toggle becomes redundant once Service
 Pauser manages it — set as `own_toggle_key`, it gets hidden automatically
 while managed here and reappears once you disable the switch or Service
 Pauser itself, provided it was visible before Service Pauser took control.
+
+## Desktop apps
+
+Desktop apps that are not systemd services can be configured in Preferences
+under "Desktop apps". This is intended for apps such as Flatpak Signal, where
+GNOME autostart launches a `.desktop` file instead of a `.service` unit. The
+default configuration includes Signal:
+
+```json
+{
+  "id": "signal",
+  "label": "Signal",
+  "kind": "flatpak",
+  "app_id": "org.signal.Signal",
+  "desktop_id": "org.signal.Signal.desktop",
+  "enabled": true
+}
+```
+
+`kind` may be `flatpak` or `snap`. Flatpak targets are stopped with
+`flatpak kill <app_id>`. Snap desktop apps are matched by their process command
+and stopped with `SIGTERM`. Resume only restarts an app if Service Pauser found
+it running when pause was activated. If no start command is configured, Service
+Pauser resumes Flatpak apps with `flatpak run <app_id>` and Snap apps with
+`snap run <app_id>`. Set a start command only when an app needs a different
+launcher or extra flags, for example a tray/background option.
 
 ## Manual Recovery
 

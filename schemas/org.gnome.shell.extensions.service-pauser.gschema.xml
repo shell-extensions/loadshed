@@ -26,5 +26,15 @@
       <summary>Saved values for managed GSettings switches</summary>
       <description>Internal state used to restore GSettings switches to the values they had before Service Pauser changed them.</description>
     </key>
+    <key name="app-targets" type="s">
+      <default>'[{"id":"signal","label":"Signal","kind":"flatpak","app_id":"org.signal.Signal","desktop_id":"org.signal.Signal.desktop","enabled":true}]'</default>
+      <summary>Desktop apps to stop alongside services</summary>
+      <description>JSON list of Flatpak or Snap desktop app targets stopped together with the pause button. Snap daemons remain normal systemd service entries.</description>
+    </key>
+    <key name="app-runtime-state" type="s">
+      <default>'{"paused":{}}'</default>
+      <summary>Saved state for managed desktop apps</summary>
+      <description>Internal state used to restart desktop apps only when Service Pauser stopped them while pausing.</description>
+    </key>
   </schema>
 </schemalist>

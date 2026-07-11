@@ -80,6 +80,7 @@ bundle_source="${pack_dir}/source"
   "${script_dir}/metadata.json" \
   "${script_dir}/extension.js" \
   "${script_dir}/prefs.js" \
+  "${script_dir}/appTargets.js" \
   "${script_dir}/gsettingsTargets.js" \
   "${script_dir}/stylesheet.css" \
   "${script_dir}/README.md" \
@@ -96,6 +97,7 @@ echo "Packing extension bundle"
   --gettext-domain=service-pauser \
   --extra-source=install.sh \
   --extra-source=README.md \
+  --extra-source=appTargets.js \
   --extra-source=gsettingsTargets.js \
   --extra-source=po \
   --extra-source=tools \

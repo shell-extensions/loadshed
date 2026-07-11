@@ -3,10 +3,12 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
+import { PopupAnimation } from 'resource:///org/gnome/shell/ui/boxpointer.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js';
 import { Extension, gettext as _, ngettext } from 'resource:///org/gnome/shell/extensions/extension.js';
+import { AppTargets } from './appTargets.js';
 import { GSettingsTargets } from './gsettingsTargets.js';
 
 const HELPER_INSTALL_PATH = '/usr/local/bin/service-pauser-helper';
@@ -19,26 +21,35 @@ function formatCountLabel(label, count) {
 class ServicePauserManager {
     constructor(settings) {
         this._targets = new GSettingsTargets(settings);
+        this._apps = new AppTargets(settings);
     }
 
-    reloadTargets(pauseActive) {
+    async reloadTargets(pauseActive) {
         this._targets.reload(pauseActive);
+        await this._apps.reload(pauseActive);
     }
 
-    applyPause() {
+    async applyPause() {
         this._targets.applyPause();
+        await this._apps.applyPause();
     }
 
     applyResume() {
+        // AppTargets.applyResume() only fires GLib.spawn_async() (already
+        // non-blocking) and never awaits a subprocess result, so it stays
+        // synchronous here too.
         this._targets.applyResume();
+        this._apps.applyResume();
     }
 
-    enforceTargets() {
+    async enforceTargets() {
         this._targets.enforce();
+        await this._apps.enforce();
     }
 
-    targetsStatus() {
-        return this._targets.status();
+    async targetsStatus() {
+        const appEntries = await this._apps.status();
+        return this._targets.status().concat(appEntries);
     }
 
     hideOwnToggles() {
@@ -137,6 +148,7 @@ class ServicePauserToggle extends QuickSettings.QuickMenuToggle {
         });
 
         this._settings = extensionObject._settings;
+        this._extensionObject = extensionObject;
         this._manager = manager;
         this._indicator = indicator;
         this._busy = false;
@@ -148,7 +160,7 @@ class ServicePauserToggle extends QuickSettings.QuickMenuToggle {
         this._itemsSection = new PopupMenu.PopupMenuSection();
         this.menu.addMenuItem(this._itemsSection);
         this.menu.addAction(_('Refresh'), () => this._refresh());
-        this.menu.addAction(_('Resume managed services'), () => this._runAction('resume'));
+        this.menu.addAction(_('Settings'), () => this._openPreferences());
         this.menu.addAction(_('Setup help'), () => this._notifySetupRequired());
 
         this._clickedId = this.connect('clicked', () => this._togglePaused());
@@ -209,19 +221,23 @@ class ServicePauserToggle extends QuickSettings.QuickMenuToggle {
         this._runAction(this.checked ? 'pause' : 'resume');
     }
 
+    _openPreferences() {
+        this._extensionObject.openPreferences();
+        Main.panel.statusArea.quickSettings.menu.close(PopupAnimation.FADE);
+    }
+
     _refresh() {
         if (this._busy) {
             return;
         }
 
         const action = this.checked ? 'enforce' : 'status';
-        if (this.checked) {
-            this._manager.enforceTargets();
-        }
+        const preAction = this.checked ? this._manager.enforceTargets() : Promise.resolve();
 
         this._busy = true;
         this.subtitle = _('Refreshing');
-        this._manager.run(action)
+        preAction
+            .then(() => this._manager.run(action))
             .then(status => this._applyStatus(status))
             .catch(error => this._handleError(error))
             .finally(() => {
@@ -234,15 +250,19 @@ class ServicePauserToggle extends QuickSettings.QuickMenuToggle {
             return;
         }
 
+        let preAction;
         if (action === 'pause') {
-            this._manager.applyPause();
+            preAction = this._manager.applyPause();
         } else if (action === 'resume') {
-            this._manager.applyResume();
+            preAction = Promise.resolve(this._manager.applyResume());
+        } else {
+            preAction = Promise.resolve();
         }
 
         this._busy = true;
         this.subtitle = action === 'pause' ? _('Pausing') : _('Resuming');
-        this._manager.run(action)
+        preAction
+            .then(() => this._manager.run(action))
             .then(status => this._applyStatus(status))
             .catch(error => this._handleError(error))
             .finally(() => {
@@ -279,14 +299,14 @@ class ServicePauserToggle extends QuickSettings.QuickMenuToggle {
         );
     }
 
-    _applyStatus(status) {
+    async _applyStatus(status) {
         const helperEntries = Array.isArray(status.entries) ? status.entries : [];
         const helperPaused = Boolean(status.paused);
-        let targetEntries = this._manager.targetsStatus();
+        let targetEntries = await this._manager.targetsStatus();
         const targetManaged = targetEntries.some(entry => entry.managed);
         if (helperPaused || targetManaged) {
-            this._manager.enforceTargets();
-            targetEntries = this._manager.targetsStatus();
+            await this._manager.enforceTargets();
+            targetEntries = await this._manager.targetsStatus();
         }
         const entries = helperEntries.concat(targetEntries);
 
@@ -464,6 +484,7 @@ export default class ServicePauserExtension extends Extension {
         this._manager = null;
         this._indicator = null;
         this._targetsSignalId = 0;
+        this._appTargetsSignalId = 0;
     }
 
     enable() {
@@ -474,9 +495,17 @@ export default class ServicePauserExtension extends Extension {
         // redundant while we manage it.
         this._manager.hideOwnToggles();
 
+        // GObject signal callbacks can't be awaited, so these fire the
+        // (now async) reload and just log if it ever rejects.
         this._targetsSignalId = this._settings.connect('changed::gsettings-targets', () => {
             const pauseActive = Boolean(this._indicator?.paused);
-            this._manager.reloadTargets(pauseActive);
+            this._manager.reloadTargets(pauseActive)
+                .catch(error => logError(error, 'Service Pauser: failed to reload GSettings targets'));
+        });
+        this._appTargetsSignalId = this._settings.connect('changed::app-targets', () => {
+            const pauseActive = Boolean(this._indicator?.paused);
+            this._manager.reloadTargets(pauseActive)
+                .catch(error => logError(error, 'Service Pauser: failed to reload app targets'));
         });
 
         this._indicator = new ServicePauserIndicator(this, this._manager);
@@ -487,6 +516,10 @@ export default class ServicePauserExtension extends Extension {
             this._settings.disconnect(this._targetsSignalId);
         }
         this._targetsSignalId = 0;
+        if (this._settings && this._appTargetsSignalId) {
+            this._settings.disconnect(this._appTargetsSignalId);
+        }
+        this._appTargetsSignalId = 0;
 
         if (this._settings?.get_boolean('auto-resume-on-disable')) {
             this._manager?.resumeDetached();
