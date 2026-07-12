@@ -12,8 +12,8 @@ services that start later.
 ## Install
 
 ```bash
-git clone https://github.com/system-extensions/loadshed
-cd loadshed
+git clone https://github.com/system-extensions/loadshed loadshed@yurij.de
+cd loadshed@yurij.de
 ./install.sh
 ```
 
@@ -29,7 +29,8 @@ gnome-extensions enable loadshed@yurij.de
 
 The GNOME Shell UUID is `loadshed@yurij.de`. The helper, config directory,
 gettext domain, and settings schema still use `service-pauser` for compatibility
-with existing installations.
+with existing installations. Any remaining `service-pauser` paths or commands
+below refer to those compatibility interfaces, not to the extension UUID.
 
 If you previously installed the old UUID, disable it after the new extension is
 installed:
