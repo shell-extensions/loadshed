@@ -143,7 +143,7 @@ msgstr "Kein Schema/Schlüssel"
 
 #: prefs.js:98
 msgid "No app target"
-msgstr ""
+msgstr "Kein App-Ziel"
 
 #: prefs.js:146
 msgid "General"

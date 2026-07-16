@@ -1,5 +1,7 @@
 # Loadshed
 
+**English** | [Deutsch](README.de.md) | [Español](README.es.md)
+
 GNOME Shell extension for pausing selected background maintenance services from Quick Settings.
 
 The extension delegates privileged work to `/usr/local/bin/service-pauser-helper`.
@@ -9,11 +11,16 @@ are stopped while paused and only restarted if the helper stopped them. While th
 Quick Settings button is paused, refreshes enforce that state again for configured
 services that start later.
 
+## Screenshots
+
+![Loadshed menu with running services](image/loadshed-running.png)
+![Loadshed menu with paused services](image/loadshed-paused.png)
+
 ## Install
 
 ```bash
-git clone https://github.com/system-extensions/loadshed loadshed@yurij.de
-cd loadshed@yurij.de
+git clone https://github.com/system-extensions/loadshed
+cd loadshed
 ./install.sh
 ```
 
@@ -27,7 +34,8 @@ Log out and back in, then enable:
 gnome-extensions enable loadshed@yurij.de
 ```
 
-The GNOME Shell UUID is `loadshed@yurij.de`. The helper, config directory,
+The source checkout is named `loadshed`, while the GNOME Shell UUID and installed
+extension directory are `loadshed@yurij.de`. The helper, config directory,
 gettext domain, and settings schema still use `service-pauser` for compatibility
 with existing installations. Any remaining `service-pauser` paths or commands
 below refer to those compatibility interfaces, not to the extension UUID.
