@@ -19,7 +19,7 @@ configurados que arranquen más tarde.
 ## Instalación
 
 ```bash
-git clone https://github.com/system-extensions/loadshed
+git clone https://github.com/shell-extensions/loadshed
 cd loadshed
 ./install.sh
 ```
@@ -75,7 +75,7 @@ por systemd/snap para ese daemon.
 ## Interruptores de extensión
 
 No todo lo que merece pausarse es una unidad systemd. La extensión compatible
-[Folder Size](https://github.com/system-extensions/foldersize) escanea tamaños de carpetas en
+[Folder Size](https://github.com/nautilus-extensions/foldersize) escanea tamaños de carpetas en
 Nautilus, Caja o Nemo y guarda su interruptor de escaneo en `~/.config/foldersize.conf`. Loadshed
 incluye un preset de objetivo de archivo para Folder Size que establece `FolderSize:auto_scan=false`
 durante la pausa y restaura el estado anterior al reanudar. El objetivo se gestiona en la sesión del

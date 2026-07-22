@@ -19,7 +19,7 @@ services that start later.
 ## Install
 
 ```bash
-git clone https://github.com/system-extensions/loadshed
+git clone https://github.com/shell-extensions/loadshed
 cd loadshed
 ./install.sh
 ```
@@ -75,7 +75,7 @@ Use the exact unit name shown by systemd/snap for that daemon.
 ## Extension switches
 
 Not everything worth pausing is a systemd unit. The supported
-[Folder Size](https://github.com/system-extensions/foldersize) extension scans
+[Folder Size](https://github.com/nautilus-extensions/foldersize) extension scans
 folder sizes in Nautilus, Caja, or Nemo and stores its scan toggle in
 `~/.config/foldersize.conf`. Loadshed ships a Folder Size file-target preset
 that sets `FolderSize:auto_scan=false` while paused and restores the previous

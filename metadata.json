@@ -5,7 +5,7 @@
   "gettext-domain": "loadshed",
   "settings-schema": "org.gnome.shell.extensions.loadshed",
   "shell-version": ["46", "47", "48", "49"],
-  "url": "https://github.com/system-extensions/loadshed",
+  "url": "https://github.com/shell-extensions/loadshed",
   "version": 1,
   "license": "GPL-3.0-or-later"
 }

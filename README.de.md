@@ -19,7 +19,7 @@ Zustand erneut für konfigurierte Dienste, die später starten.
 ## Installation
 
 ```bash
-git clone https://github.com/system-extensions/loadshed
+git clone https://github.com/shell-extensions/loadshed
 cd loadshed
 ./install.sh
 ```
@@ -75,7 +75,7 @@ Unit-Namen, den systemd/snap für diesen Daemon anzeigt.
 ## Erweiterungsschalter
 
 Nicht alles, was sich zu pausieren lohnt, ist eine systemd-Unit. Die unterstützte
-[Folder Size](https://github.com/system-extensions/foldersize)-Erweiterung scannt Ordnergrößen in
+[Folder Size](https://github.com/nautilus-extensions/foldersize)-Erweiterung scannt Ordnergrößen in
 Nautilus, Caja oder Nemo und speichert ihren Scan-Schalter in `~/.config/foldersize.conf`. Loadshed
 liefert ein Folder-Size-Dateiziel-Preset mit, das während der Pause `FolderSize:auto_scan=false`
 setzt und beim Fortsetzen den vorherigen Zustand wiederherstellt. Das Ziel wird in der
