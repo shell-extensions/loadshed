@@ -138,3 +138,8 @@ sudo /usr/local/bin/loadshed-helper status
 sudo /usr/local/bin/loadshed-helper resume
 sudo /usr/local/bin/loadshed-helper config-get
 ```
+
+## Licencia
+
+Loadshed es software libre, publicado bajo la GNU General Public License v3.0 o posterior
+(GPL-3.0-or-later). El texto completo está disponible en el archivo [LICENSE](LICENSE).
