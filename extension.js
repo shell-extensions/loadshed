@@ -32,6 +32,15 @@ import { FileTargets } from './fileTargets.js';
 
 const HELPER_INSTALL_PATH = '/usr/local/bin/loadshed-helper';
 const DEFAULT_REFRESH_INTERVAL = 10;
+// Fixed slot in the 2-column Quick Settings grid, right column of the row
+// below hotspot@yurij.de (which pins itself to 4) and beside epp-modes
+// (which pins itself to 6, the left column of that same row). Self-contained
+// on purpose: an earlier attempt to have epp-modes reach into loadshed at
+// runtime via Extension.lookupByUUID() and reposition it from the outside
+// was unreliable, most likely because extension enable() order across
+// independently-loaded extensions isn't guaranteed, so the lookup could run
+// before loadshed had even added its own toggle to the grid.
+const TARGET_POSITION = 7;
 
 function formatCountLabel(label, count) {
     return label.replace('%d', String(count));
@@ -489,10 +498,43 @@ class LoadshedIndicator extends QuickSettings.SystemIndicator {
         this.quickSettingsItems.push(this._toggle);
 
         Main.panel.statusArea.quickSettings.addExternalIndicator(this);
+
+        // Delay until after the mainloop turn in which addExternalIndicator
+        // ran, so every extension's toggle is already in the grid — same
+        // one-shot technique as hotspot@yurij.de's own moveToDefaultPosition().
+        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => this._reorderToggle());
     }
 
     get paused() {
         return Boolean(this._toggle?.checked);
+    }
+
+    _reorderToggle() {
+        const grid = Main.panel?.statusArea?.quickSettings?.menu?._grid;
+        if (!grid?.get_children)
+            return GLib.SOURCE_REMOVE;
+
+        const toggles = grid.get_children().filter(child =>
+            child instanceof QuickSettings.QuickToggle ||
+            child instanceof QuickSettings.QuickMenuToggle);
+
+        const currentIndex = toggles.indexOf(this._toggle);
+        if (currentIndex === -1)
+            return GLib.SOURCE_REMOVE;
+
+        const desired = Math.min(Math.max(0, TARGET_POSITION), toggles.length - 1);
+        if (desired !== currentIndex) {
+            toggles.splice(currentIndex, 1);
+            toggles.splice(desired, 0, this._toggle);
+
+            let last = null;
+            for (const item of toggles) {
+                grid.set_child_above_sibling(item, last);
+                last = item;
+            }
+        }
+
+        return GLib.SOURCE_REMOVE;
     }
 
     destroy() {
