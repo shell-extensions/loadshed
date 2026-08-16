@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -32,7 +33,17 @@ CONFIG_DIR = "/etc/loadshed"
 CONFIG_PATH = f"{CONFIG_DIR}/units.json"
 STATE_DIR = "/run/loadshed"
 STATE_PATH = f"{STATE_DIR}/state.json"
+GATE_SOCKET_PATH = f"{STATE_DIR}/gate.sock"
 CGROUP_ROOT = "/sys/fs/cgroup"
+GATE_TIMEOUT = 3.0
+
+# Legacy process names are accepted only as a migration input.  Resolution is
+# deliberately independent of PATH so a user-controlled environment cannot
+# select the executable that receives an execution permission mark.
+LEGACY_EXECUTABLE_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+LEGACY_CANONICAL_PATHS = {
+    "rsync": "/usr/bin/rsync",
+}
 
 VALID_ID_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 VALID_UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:\\-]+\.(service|timer)$")
@@ -52,6 +63,10 @@ def fail(message, action="error"):
         "ok": False,
         "action": action,
         "paused": False,
+        "pause_intent": False,
+        "gate_healthy": False,
+        "gate_active": False,
+        "queued_exec_count": 0,
         "error": message,
         "entries": [],
         "errors": [message],
@@ -77,6 +92,58 @@ def validate_unit_name(unit, suffix):
     return unit
 
 
+def normalize_executable_path(executable, require_exists=False):
+    if not isinstance(executable, str) or not executable.startswith("/"):
+        raise LoadshedError(f"executable must be an absolute path: {executable!r}")
+    if "\x00" in executable:
+        raise LoadshedError("executable path contains NUL")
+
+    path = os.path.normpath(executable)
+    if require_exists:
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            raise LoadshedError(f"executable not found: {path}") from exc
+        if not stat.S_ISREG(st.st_mode) or not os.access(path, os.X_OK):
+            raise LoadshedError(f"executable is not an executable regular file: {path}")
+
+    # Resolve symlinks when the file exists so the gate and /proc identity
+    # refer to the same inode.  Keep a normalized absolute path for an absent
+    # target; require_exists=True already rejected it above unless the
+    # caller treats a missing optional target as "skip" instead of an error
+    # (see gate_targets()).
+    return os.path.realpath(path) if os.path.exists(path) else path
+
+
+def resolve_legacy_process(process):
+    if not isinstance(process, str) or not VALID_PROCESS_RE.match(process):
+        raise LoadshedError(f"invalid legacy process name: {process!r}")
+
+    candidates = []
+    for directory in LEGACY_EXECUTABLE_DIRS:
+        path = os.path.join(directory, process)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            canonical = normalize_executable_path(path, require_exists=True)
+            if canonical not in candidates:
+                candidates.append(canonical)
+
+    if len(candidates) > 1:
+        raise LoadshedError(
+            f"legacy process {process!r} is ambiguous; configure an absolute executable path"
+        )
+    if candidates:
+        return candidates[0]
+
+    canonical = LEGACY_CANONICAL_PATHS.get(process)
+    if canonical:
+        return normalize_executable_path(canonical)
+
+    raise LoadshedError(
+        f"legacy process {process!r} has no executable in fixed system paths; "
+        "configure an absolute executable path"
+    )
+
+
 def validate_entry(raw, index):
     if not isinstance(raw, dict):
         raise LoadshedError(f"unit entry #{index + 1} is not an object")
@@ -86,6 +153,7 @@ def validate_entry(raw, index):
     service = raw.get("service")
     timer = raw.get("timer")
     process = raw.get("process")
+    executable = raw.get("executable")
     optional = raw.get("optional", False)
     enabled = raw.get("enabled", True)
 
@@ -97,6 +165,8 @@ def validate_entry(raw, index):
         raise LoadshedError(f"invalid service in unit entry {entry_id}")
     if process is not None and not isinstance(process, str):
         raise LoadshedError(f"invalid process in unit entry {entry_id}")
+    if executable is not None and not isinstance(executable, str):
+        raise LoadshedError(f"invalid executable in unit entry {entry_id}")
     if not isinstance(optional, bool):
         raise LoadshedError(f"invalid optional flag in unit entry {entry_id}")
     if not isinstance(enabled, bool):
@@ -107,15 +177,23 @@ def validate_entry(raw, index):
         service = service.strip() or None
     if process is not None:
         process = process.strip() or None
-    if not service and not process:
-        raise LoadshedError(f"unit entry {entry_id} needs a service or process")
-    if service and process:
-        raise LoadshedError(f"unit entry {entry_id} cannot mix service and process")
+    if executable is not None:
+        executable = executable.strip() or None
+    if not service and not process and not executable:
+        raise LoadshedError(f"unit entry {entry_id} needs a service or executable")
+    if service and (process or executable):
+        raise LoadshedError(f"unit entry {entry_id} cannot mix a service and executable")
+    if process and executable:
+        raise LoadshedError(f"unit entry {entry_id} cannot mix process and executable")
 
     if service:
         service = validate_unit_name(service, ".service")
     if process and not VALID_PROCESS_RE.match(process):
         raise LoadshedError(f"invalid process name in unit entry {entry_id}: {process!r}")
+    if process:
+        executable = resolve_legacy_process(process)
+    if executable:
+        executable = normalize_executable_path(executable)
     if isinstance(timer, str):
         timer = timer.strip() or None
     if timer is not None:
@@ -133,7 +211,7 @@ def validate_entry(raw, index):
         entry["service"] = service
         entry["timer"] = timer
     else:
-        entry["process"] = process
+        entry["executable"] = executable
     return entry
 
 
@@ -158,7 +236,7 @@ def validate_units(raw_units):
 def target_key(unit):
     if unit.get("service"):
         return ("service", unit["service"])
-    return ("process", unit["process"])
+    return ("executable", unit["executable"])
 
 
 def load_units():
@@ -175,7 +253,14 @@ def load_units():
     with open(CONFIG_PATH, "r", encoding="utf-8") as config_file:
         raw_units = json.load(config_file)
 
-    return validate_units(raw_units)
+    units = validate_units(raw_units)
+    migrated = any(
+        isinstance(raw, dict) and "process" in raw and "executable" not in raw
+        for raw in raw_units
+    )
+    if migrated:
+        save_units_config(units)
+    return units
 
 
 def serialize_units(units):
@@ -188,7 +273,7 @@ def serialize_units(units):
         if unit.get("service"):
             entry["service"] = unit["service"]
         else:
-            entry["process"] = unit["process"]
+            entry["executable"] = unit["executable"]
         if unit.get("timer"):
             entry["timer"] = unit["timer"]
         if unit.get("optional"):
@@ -228,29 +313,44 @@ def enabled_units(units):
 
 
 def load_state():
+    default = {"paused": False, "generation": 0, "entries": {}}
     try:
         st = os.stat(STATE_PATH)
     except FileNotFoundError:
-        return {"entries": {}}
+        return default
 
     if st.st_uid != 0 or (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
-        return {"entries": {}}
+        return default
 
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as state_file:
             state = json.load(state_file)
     except (OSError, json.JSONDecodeError):
-        return {"entries": {}}
+        return default
 
+    if not isinstance(state, dict):
+        return default
     entries = state.get("entries")
     if not isinstance(entries, dict):
-        return {"entries": {}}
-    return {"entries": entries}
+        entries = {}
+    generation = state.get("generation", 0)
+    if not isinstance(generation, int) or generation < 0:
+        generation = 0
+    return {
+        "paused": state.get("paused") is True,
+        "generation": generation,
+        "entries": entries,
+    }
 
 
 def save_state(state):
+    state = {
+        "paused": state.get("paused") is True,
+        "generation": state.get("generation", 0),
+        "entries": state.get("entries", {}),
+    }
     entries = state.get("entries", {})
-    if not entries:
+    if not state["paused"] and not entries:
         try:
             os.unlink(STATE_PATH)
         except FileNotFoundError:
@@ -265,6 +365,95 @@ def save_state(state):
         state_file.write("\n")
     os.chmod(tmp_path, 0o644)
     os.replace(tmp_path, STATE_PATH)
+
+
+def gate_request(command, **fields):
+    request = {"command": command, **fields}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(GATE_TIMEOUT)
+            client.connect(GATE_SOCKET_PATH)
+            client.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+            response = b""
+            while not response.endswith(b"\n"):
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                response += chunk
+    except OSError as exc:
+        raise LoadshedError(f"loadshed-gate is not reachable: {exc}") from exc
+
+    if not response:
+        raise LoadshedError("loadshed-gate returned no response")
+    try:
+        payload = json.loads(response.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LoadshedError("loadshed-gate returned invalid JSON") from exc
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        message = payload.get("error") if isinstance(payload, dict) else None
+        raise LoadshedError(message or "loadshed-gate rejected the request")
+    return payload
+
+
+def gate_targets(units):
+    targets = []
+    for unit in units:
+        executable = unit.get("executable")
+        if not executable:
+            continue
+        try:
+            executable = normalize_executable_path(executable, require_exists=True)
+        except LoadshedError:
+            if unit.get("optional"):
+                continue
+            raise
+        targets.append({"id": unit["id"], "executable": executable})
+    return targets
+
+
+def gate_configure(units, generation):
+    targets = gate_targets(units)
+    response = gate_request(
+        "configure",
+        paused=True,
+        generation=generation,
+        targets=targets,
+    )
+    if not response.get("active") or not response.get("healthy", True):
+        raise LoadshedError("loadshed-gate did not confirm active execution marks")
+    return response
+
+
+def gate_release(generation):
+    response = gate_request("release", generation=generation)
+    if response.get("active"):
+        raise LoadshedError("loadshed-gate did not confirm release")
+    if not response.get("healthy", True):
+        raise LoadshedError(response.get("error") or "loadshed-gate reported a release error")
+    return response
+
+
+def gate_status():
+    try:
+        response = gate_request("status")
+        return {
+            "healthy": bool(response.get("healthy", True)),
+            "active": bool(response.get("active")),
+            "queued_exec_count": int(response.get("queued_exec_count", 0)),
+            "generation": response.get("generation"),
+            "error": response.get("error"),
+        }
+    except (LoadshedError, ValueError, TypeError) as exc:
+        # A malformed gate response (unexpected type for queued_exec_count,
+        # for example) must degrade to the same "gate unhealthy" shape as a
+        # LoadshedError, not crash the caller.
+        return {
+            "healthy": False,
+            "active": False,
+            "queued_exec_count": 0,
+            "generation": None,
+            "error": str(exc),
+        }
 
 
 def systemctl(args, check=False):
@@ -322,20 +511,26 @@ def optional_service_missing(unit, managed_state=None):
 
 
 def catalog_status_payload(units):
-    managed = load_state().get("entries", {})
+    state = load_state()
+    managed = state.get("entries", {})
     entries = []
     for unit in units:
-        managed_state = managed.get(unit["id"], {})
-        if unit.get("process"):
-            processes = find_processes(unit["process"])
-            managed_active = bool(managed_state.get("process_stopped"))
+        managed_state = managed.get(unit["id"])
+        if unit.get("executable"):
+            executable = unit["executable"]
+            try:
+                available = bool(normalize_executable_path(executable, require_exists=True))
+            except LoadshedError:
+                available = False
+            processes = find_processes(executable) if available else []
+            managed_active = bool(state.get("paused") and managed_state is not None)
             process_active = bool(processes)
             entries.append({
                 "id": unit["id"],
                 "label": unit["label"],
-                "process": unit["process"],
+                "executable": executable,
                 "optional": unit.get("optional", False),
-                "available": True,
+                "available": available,
                 "process_active": process_active,
                 "process_count": len(processes),
                 "managed": managed_active,
@@ -349,6 +544,7 @@ def catalog_status_payload(units):
         timer_loaded = unit_loaded(timer_status) if unit.get("timer") else False
         service_active = service_status.get("ActiveState") in ("active", "activating")
         timer_active = timer_status.get("ActiveState") == "active"
+        managed_state = managed_state or {}
         managed_active = bool(managed_state.get("service_frozen") or managed_state.get("timer_stopped"))
         available = service_loaded and (not unit.get("timer") or timer_loaded)
 
@@ -486,6 +682,23 @@ def proc_comm(pid):
         return None
 
 
+def proc_executable(pid):
+    try:
+        target = os.readlink(os.path.join("/proc", str(pid), "exe"))
+    except OSError:
+        return None
+    if target.endswith(" (deleted)"):
+        # The kernel appends this when the inode a running process is
+        # executing from was unlinked -- typically a package upgrade
+        # replacing the binary in place while the process is still up.
+        # Strip it and keep matching by the original path, the same way
+        # tools/loadshed-gate strips it from fanotify event paths.
+        # Otherwise a running process silently becomes untrackable the
+        # moment its backing binary is upgraded.
+        target = target[: -len(" (deleted)")]
+    return normalize_executable_path(target)
+
+
 def proc_state(pid):
     try:
         status = PathLikeProc(pid, "status").read_text()
@@ -498,7 +711,8 @@ def proc_state(pid):
     return None
 
 
-def find_processes(process):
+def find_processes(executable):
+    executable = normalize_executable_path(executable)
     matches = []
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -506,7 +720,7 @@ def find_processes(process):
         pid = int(name)
         if pid == os.getpid():
             continue
-        if proc_comm(pid) != process:
+        if proc_executable(pid) != executable:
             continue
         start_time = proc_stat_start_time(pid)
         if start_time is None:
@@ -519,67 +733,87 @@ def find_processes(process):
     return matches
 
 
-def process_is_same(pid, process, start_time):
-    return proc_comm(pid) == process and proc_stat_start_time(pid) == start_time
+def process_is_same(pid, executable, start_time):
+    return (
+        proc_executable(pid) == normalize_executable_path(executable) and
+        proc_stat_start_time(pid) == start_time
+    )
 
 
-def stop_process(pid, process, start_time):
-    if process_is_same(pid, process, start_time):
+def stop_process(pid, executable, start_time):
+    if process_is_same(pid, executable, start_time):
         os.kill(pid, signal.SIGSTOP)
 
 
-def continue_process(pid, process, start_time):
-    if process_is_same(pid, process, start_time):
+def continue_process(pid, executable, start_time):
+    if process_is_same(pid, executable, start_time):
         os.kill(pid, signal.SIGCONT)
 
 
 def pause_process(unit, entry_state, errors):
-    process = unit["process"]
+    executable = unit["executable"]
     processes = {
         str(pid): proc
         for pid, proc in (entry_state.get("processes") or {}).items()
-        if process_is_same(int(pid), process, str(proc.get("start_time")))
+        if process_is_same(int(pid), executable, str(proc.get("start_time")))
     }
 
-    for proc in find_processes(process):
+    for proc in find_processes(executable):
         pid_key = str(proc["pid"])
         if proc.get("state") != "T":
             try:
-                stop_process(proc["pid"], process, proc["start_time"])
+                stop_process(proc["pid"], executable, proc["start_time"])
             except OSError as exc:
                 errors.append(f"{unit['label']}: failed to stop pid {proc['pid']}: {exc}")
                 continue
         processes[pid_key] = {
             "start_time": proc["start_time"],
-            "process": process,
+            "executable": executable,
         }
 
+    entry_state["executable"] = executable
     entry_state["processes"] = processes
     entry_state["process_stopped"] = bool(processes)
     return entry_state
 
 
-def pause_units(units):
+def pause_units(units, new_pause=True):
     state = load_state()
     entries = state.setdefault("entries", {})
     errors = []
+
+    if new_pause or not state.get("paused"):
+        state["paused"] = True
+        state["generation"] = int(state.get("generation", 0)) + 1
+        save_state(state)
+    else:
+        state["paused"] = True
+
+    try:
+        gate = gate_configure(units, state["generation"])
+        state["gate"] = gate
+    except LoadshedError as exc:
+        # A gate failure must not stop the actual pause: SIGSTOP/freeze below
+        # is what protects the system.  Record the failure and degrade to a
+        # non-strict pause (status_payload reports pause_intent without
+        # paused) instead of leaving nothing paused at all.
+        state["gate"] = {"healthy": False, "active": False, "error": str(exc)}
+        errors.append(str(exc))
 
     for unit in units:
         if optional_service_missing(unit, entries.get(unit["id"])):
             continue
 
-        if unit.get("process"):
+        if unit.get("executable"):
             entry_state = entries.get(unit["id"], {
-                "process": unit["process"],
+                "executable": unit["executable"],
                 "process_stopped": False,
                 "processes": {},
             })
             entry_state = pause_process(unit, entry_state, errors)
-
-            if entry_state.get("process_stopped"):
-                entries[unit["id"]] = entry_state
-            else:
-                entries.pop(unit["id"], None)
+            # Keep the entry even when no process exists.  It is the durable
+            # pause intent that lets the gate catch a future direct exec.
+            entries[unit["id"]] = entry_state
             continue
 
         entry_state = entries.get(unit["id"], {
@@ -630,9 +864,9 @@ def pause_units(units):
 
 
 def enforce_units(units):
-    if not load_state().get("entries"):
+    if not load_state().get("paused"):
         return []
-    return pause_units(units)
+    return pause_units(units, new_pause=False)
 
 
 def units_by_id(units):
@@ -641,14 +875,15 @@ def units_by_id(units):
 
 def state_unit_from_entry(entry_id, entry_state, configured):
     configured_unit = configured.get(entry_id, {})
-    process = entry_state.get("process", configured_unit.get("process"))
-    if process is not None:
-        if not isinstance(process, str) or not VALID_PROCESS_RE.match(process):
-            raise LoadshedError(f"invalid process name: {process!r}")
+    executable = entry_state.get("executable", configured_unit.get("executable"))
+    if executable is None and entry_state.get("process") is not None:
+        executable = resolve_legacy_process(entry_state["process"])
+    if executable is not None:
+        executable = normalize_executable_path(executable)
         return {
             "id": entry_id,
             "label": configured_unit.get("label", entry_id),
-            "process": process,
+            "executable": executable,
             "optional": configured_unit.get("optional", False),
             "enabled": configured_unit.get("enabled", True),
         }
@@ -674,6 +909,7 @@ def resume_units(units, entry_ids=None):
     entries = state.get("entries", {})
     configured = units_by_id(units)
     selected_ids = set(entries) if entry_ids is None else set(entry_ids)
+    full_resume = entry_ids is None
     remaining = {
         entry_id: entry_state
         for entry_id, entry_state in entries.items()
@@ -694,12 +930,12 @@ def resume_units(units, entry_ids=None):
 
         keep_state = dict(entry_state)
         if keep_state.get("process_stopped"):
-            process = unit.get("process")
-            if process:
+            executable = unit.get("executable")
+            if executable:
                 kept_processes = {}
                 for pid, proc in (entry_state.get("processes") or {}).items():
                     try:
-                        continue_process(int(pid), process, str(proc.get("start_time")))
+                        continue_process(int(pid), executable, str(proc.get("start_time")))
                     except OSError as exc:
                         if exc.errno != errno.ESRCH:
                             errors.append(f"{unit['label']}: process resume failed for {pid}: {exc}")
@@ -733,7 +969,20 @@ def resume_units(units, entry_ids=None):
         elif keep_state.get("process_stopped"):
             remaining[entry_id] = keep_state
 
-    save_state({"entries": remaining})
+    state["entries"] = remaining
+    save_state(state)
+
+    if full_resume and not remaining:
+        try:
+            gate = gate_release(state.get("generation", 0))
+            state["paused"] = False
+            state["gate"] = gate
+            save_state(state)
+        except LoadshedError as exc:
+            errors.append(str(exc))
+            state["paused"] = True
+            state["gate"] = {"healthy": False, "active": True, "error": str(exc)}
+            save_state(state)
     return errors
 
 
@@ -752,7 +1001,7 @@ def reconcile_config_state(old_units, new_units):
 
         if (
             entry_state.get("service") != new_unit.get("service") or
-            entry_state.get("process") != new_unit.get("process") or
+            entry_state.get("executable") != new_unit.get("executable") or
             entry_state.get("timer") != new_unit.get("timer")
         ):
             stale_ids.append(entry_id)
@@ -768,6 +1017,7 @@ def status_payload(units, action, errors=None):
     managed = state.get("entries", {})
     configured = units_by_id(units)
     active_units = enabled_units(units)
+    gate = gate_status()
     entries = []
     seen = set()
 
@@ -776,7 +1026,10 @@ def status_payload(units, action, errors=None):
         if optional_service_missing(unit, managed_state):
             continue
         status_unit = state_unit_from_entry(unit["id"], managed_state, configured) if managed_state else unit
-        entries.append(status_entry(status_unit, managed_state))
+        status_state = dict(managed_state or {})
+        status_state["pause_intent"] = state.get("paused")
+        status_state["gate_active"] = gate["active"]
+        entries.append(status_entry(status_unit, status_state))
         seen.add(unit["id"])
 
     for entry_id, entry_state in managed.items():
@@ -784,7 +1037,10 @@ def status_payload(units, action, errors=None):
             continue
         try:
             unit = state_unit_from_entry(entry_id, entry_state, configured)
-            entries.append(status_entry(unit, entry_state))
+            status_state = dict(entry_state)
+            status_state["pause_intent"] = state.get("paused")
+            status_state["gate_active"] = gate["active"]
+            entries.append(status_entry(unit, status_state))
         except LoadshedError as exc:
             entries.append({
                 "id": entry_id,
@@ -798,12 +1054,33 @@ def status_payload(units, action, errors=None):
 
     paused_count = sum(1 for entry in entries if entry.get("paused"))
     running_count = sum(1 for entry in entries if entry.get("service_active"))
-    errors = errors or []
+    errors = list(errors or [])
+    if not gate["healthy"]:
+        errors.append(gate["error"] or "loadshed-gate is unhealthy")
+    elif state.get("paused") and not gate["active"]:
+        errors.append("loadshed-gate is inactive while a pause intent is active")
+    generation_matches = (
+        gate.get("generation") is None or
+        gate.get("generation") == state.get("generation")
+    )
+    if state.get("paused") and not generation_matches:
+        errors.append(
+            f"loadshed-gate generation mismatch: gate={gate.get('generation')}, "
+            f"state={state.get('generation')}"
+        )
+    strict_paused = bool(
+        state.get("paused") and gate["healthy"] and gate["active"] and generation_matches
+    )
 
     return {
         "ok": not errors,
         "action": action,
-        "paused": paused_count > 0,
+        "paused": strict_paused,
+        "pause_intent": bool(state.get("paused")),
+        "gate_healthy": gate["healthy"],
+        "gate_active": gate["active"],
+        "queued_exec_count": gate["queued_exec_count"],
+        "gate_error": gate["error"],
         "paused_count": paused_count,
         "running_count": running_count,
         "entries": entries,
@@ -812,7 +1089,7 @@ def status_payload(units, action, errors=None):
 
 
 def status_entry(unit, managed_state):
-    if unit.get("process"):
+    if unit.get("executable"):
         return process_status_entry(unit, managed_state)
 
     service_status = show_unit(unit["service"], include_freezer=True, extra_properties=["ControlGroup"])
@@ -858,30 +1135,33 @@ def status_entry(unit, managed_state):
 
 def process_status_entry(unit, managed_state):
     managed_state = managed_state or {}
-    processes = find_processes(unit["process"])
+    executable_exists = os.path.exists(unit["executable"])
+    processes = find_processes(unit["executable"]) if executable_exists else []
     managed_processes = managed_state.get("processes") or {}
     stopped_processes = {
         pid: proc
         for pid, proc in managed_processes.items()
-        if process_is_same(int(pid), unit["process"], str(proc.get("start_time")))
+        if process_is_same(int(pid), unit["executable"], str(proc.get("start_time")))
     }
     process_active = bool(processes)
     process_stopped = bool(stopped_processes)
+    intent_paused = bool(managed_state.get("pause_intent") and managed_state.get("gate_active"))
+    paused = intent_paused or process_stopped
 
     return {
         "id": unit["id"],
         "label": unit["label"],
-        "process": unit["process"],
+        "executable": unit["executable"],
         "optional": unit.get("optional", False),
         "process_active": process_active,
         "process_count": len(processes),
         "process_stopped": process_stopped,
         "service_active": process_active,
         "service_frozen": process_stopped,
-        "managed": bool(managed_state.get("process_stopped")) and process_stopped,
-        "paused": bool(managed_state.get("process_stopped")) and process_stopped,
+        "managed": paused,
+        "paused": paused,
         "managed_process_stopped": bool(managed_state.get("process_stopped")) and process_stopped,
-        "error": None,
+        "error": None if executable_exists else f"executable not found: {unit['executable']}",
     }
 
 
@@ -912,11 +1192,11 @@ def main():
             old_units = load_units()
             units = validate_units(json.loads(raw_config))
             require_systemctl()
-            was_paused = bool(load_state().get("entries"))
+            was_paused = bool(load_state().get("paused"))
             errors = reconcile_config_state(old_units, units)
             if errors:
                 if was_paused:
-                    errors.extend(pause_units(enabled_units(old_units)))
+                    errors.extend(pause_units(enabled_units(old_units), new_pause=False))
                 payload = config_payload(action, old_units)
                 payload["ok"] = False
                 payload["errors"] = errors
@@ -925,7 +1205,7 @@ def main():
 
             save_units_config(units)
             if was_paused:
-                errors = pause_units(enabled_units(units))
+                errors = pause_units(enabled_units(units), new_pause=False)
 
             payload = config_payload(action, units)
             payload["ok"] = not errors
@@ -945,7 +1225,7 @@ def main():
         elif action == "enforce":
             errors = enforce_units(active_units)
         elif action == "toggle":
-            if load_state().get("entries"):
+            if load_state().get("paused"):
                 errors = resume_units(units)
                 action = "resume"
             else:

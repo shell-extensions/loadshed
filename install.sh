@@ -23,6 +23,10 @@ EXT_UUID="loadshed@yurij.de"
 LEGACY_EXT_UUID="service-pauser@yurij.de"
 HELPER_NAME="loadshed-helper"
 HELPER_INSTALL_PATH="/usr/local/bin/${HELPER_NAME}"
+GATE_NAME="loadshed-gate"
+GATE_INSTALL_PATH="/usr/local/libexec/${GATE_NAME}"
+GATE_UNIT_NAME="loadshed-gate.service"
+GATE_UNIT_PATH="/etc/systemd/system/${GATE_UNIT_NAME}"
 CONFIG_DIR="/etc/loadshed"
 CONFIG_PATH="${CONFIG_DIR}/units.json"
 SUDOERS_FILE="/etc/sudoers.d/loadshed"
@@ -32,11 +36,18 @@ LEGACY_SUDOERS_FILE="/etc/sudoers.d/service-pauser"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 helper_src="${script_dir}/tools/${HELPER_NAME}"
+gate_src="${script_dir}/tools/${GATE_NAME}"
+gate_unit_src="${script_dir}/systemd/${GATE_UNIT_NAME}"
 units_src="${script_dir}/tools/units.default.json"
 schema_src="${script_dir}/schemas/org.gnome.shell.extensions.loadshed.gschema.xml"
 
 if [[ ! -f "${helper_src}" ]]; then
   echo "Helper not found: ${helper_src}" >&2
+  exit 1
+fi
+
+if [[ ! -f "${gate_src}" || ! -f "${gate_unit_src}" ]]; then
+  echo "Loadshed gate sources are missing." >&2
   exit 1
 fi
 
@@ -47,6 +58,11 @@ fi
 
 if ! command -v sudo >/dev/null 2>&1; then
   echo "sudo not found. Install sudo or run the privileged setup manually." >&2
+  exit 1
+fi
+
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "systemctl not found; the execution gate cannot be installed." >&2
   exit 1
 fi
 
@@ -80,6 +96,12 @@ else
   as_user=()
 fi
 
+echo "Checking fanotify execution-permission support"
+if ! sudo "${gate_src}" --check; then
+  echo "The kernel or current privileges do not support FAN_OPEN_EXEC_PERM; refusing to advertise a hard pause." >&2
+  exit 1
+fi
+
 if command -v glib-compile-schemas >/dev/null 2>&1; then
   "${as_user[@]}" glib-compile-schemas "${script_dir}/schemas"
 else
@@ -95,7 +117,7 @@ pack_dir="$("${as_user[@]}" mktemp -d)"
 trap 'rm -rf "${pack_dir}"' EXIT
 bundle_source="${pack_dir}/source"
 
-"${as_user[@]}" mkdir -p "${bundle_source}/tools" "${bundle_source}/schemas" "${bundle_source}/po"
+"${as_user[@]}" mkdir -p "${bundle_source}/tools" "${bundle_source}/schemas" "${bundle_source}/systemd" "${bundle_source}/po"
 "${as_user[@]}" install -m 0644 \
   "${script_dir}/metadata.json" \
   "${script_dir}/extension.js" \
@@ -110,6 +132,8 @@ bundle_source="${pack_dir}/source"
   "${bundle_source}/"
 "${as_user[@]}" install -m 0755 "${script_dir}/install.sh" "${bundle_source}/install.sh"
 "${as_user[@]}" install -m 0755 "${helper_src}" "${bundle_source}/tools/${HELPER_NAME}"
+"${as_user[@]}" install -m 0755 "${gate_src}" "${bundle_source}/tools/${GATE_NAME}"
+"${as_user[@]}" install -m 0644 "${gate_unit_src}" "${bundle_source}/systemd/${GATE_UNIT_NAME}"
 "${as_user[@]}" install -m 0644 "${units_src}" "${bundle_source}/tools/units.default.json"
 "${as_user[@]}" install -m 0644 "${schema_src}" "${bundle_source}/schemas/"
 for translation_src in "${script_dir}"/po/*.po; do
@@ -128,6 +152,7 @@ echo "Packing extension bundle"
   --extra-source=appTargets.js \
   --extra-source=gsettingsTargets.js \
   --extra-source=fileTargets.js \
+  --extra-source=systemd \
   --extra-source=po \
   --extra-source=tools \
   -o "${pack_dir}")
@@ -137,6 +162,35 @@ echo "Installing extension bundle"
 
 echo "Installing helper to ${HELPER_INSTALL_PATH}"
 sudo install -o root -g root -m 0755 "${helper_src}" "${HELPER_INSTALL_PATH}"
+
+echo "Installing execution gate to ${GATE_INSTALL_PATH}"
+sudo install -d -o root -g root -m 0755 "$(dirname "${GATE_INSTALL_PATH}")"
+sudo install -o root -g root -m 0755 "${gate_src}" "${GATE_INSTALL_PATH}"
+sudo install -o root -g root -m 0644 "${gate_unit_src}" "${GATE_UNIT_PATH}"
+sudo systemctl daemon-reload
+sudo systemctl enable --now "${GATE_UNIT_NAME}"
+if ! sudo systemctl is-active --quiet "${GATE_UNIT_NAME}"; then
+  echo "${GATE_UNIT_NAME} is not active; refusing to advertise a hard pause." >&2
+  sudo systemctl status --no-pager "${GATE_UNIT_NAME}" >&2 || true
+  exit 1
+fi
+# Type=simple means systemd reports the unit active as soon as the process
+# starts, not once it has actually bound the socket (Python interpreter
+# start-up, loading libc via ctypes, fanotify_init(2) all still have to run
+# first).  Poll briefly instead of checking once to avoid a false failure
+# on a slow start.
+gate_socket_ready=0
+for _attempt in $(seq 1 20); do
+  if sudo test -S /run/loadshed/gate.sock; then
+    gate_socket_ready=1
+    break
+  fi
+  sleep 0.1
+done
+if [[ "${gate_socket_ready}" -ne 1 ]]; then
+  echo "${GATE_UNIT_NAME} is active but its root gate socket is missing." >&2
+  exit 1
+fi
 
 echo "Installing configuration directory ${CONFIG_DIR}"
 sudo install -d -o root -g root -m 0755 "${CONFIG_DIR}"

@@ -8,8 +8,10 @@ The extension delegates privileged work to `/usr/local/bin/loadshed-helper`.
 The helper reads and writes root-owned units in `/etc/loadshed/units.json` and uses
 `systemctl freeze`/`systemctl thaw` for services. Timers configured next to a service
 are stopped while paused and only restarted if the helper stopped them. While the
-Quick Settings button is paused, refreshes enforce that state again for configured
-services that start later.
+Quick Settings button is paused, the root-owned `loadshed-gate` uses Linux
+`FAN_OPEN_EXEC_PERM` permission events to hold direct starts of configured executable
+files in `execve()` until resume. The pause intent is kept even when no matching
+process was running when pause was activated.
 
 ## Screenshots
 
@@ -67,6 +69,27 @@ visible in the menu. Entry format:
   }
 ]
 ```
+
+Process targets use an absolute executable path rather than a process name:
+
+```json
+{
+  "id": "rsync",
+  "label": "rsync file sync",
+  "executable": "/usr/bin/rsync",
+  "optional": true
+}
+```
+
+Legacy `process` entries are migrated through fixed system paths. A missing
+optional executable is skipped silently, like an optional service; a missing
+or ambiguous non-optional executable rejects the pause with an explicit
+error. v1 covers direct starts of the configured executable; interpreter
+scripts, container-internal processes, and unconfigured hardlinks are
+outside this guarantee. Replacing the executable in place (a routine package
+upgrade) re-arms the gate on the new binary without dropping the pause. If
+the gate is unavailable, the affected targets are still paused through
+SIGSTOP/freeze, but status reports a non-strict pause instead of a hard one.
 
 Snap daemons are normal systemd units and can be added here too. For example,
 Snap usually exposes a daemon as `snap.<snap-name>.<service-name>.service`.

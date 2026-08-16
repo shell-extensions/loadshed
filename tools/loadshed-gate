@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Root execution gate for Loadshed.
+
+The daemon owns a FAN_OPEN_EXEC_PERM fanotify group.  While active, permission
+events for configured executable inodes are intentionally left unanswered;
+the caller remains blocked in execve().  ``release`` answers all queued events
+with FAN_ALLOW and turns the gate off.
+
+This is intentionally limited to direct executable files.  An interpreter
+script, a container-internal process, or a different hardlink is outside the
+v1 contract and must be configured by its actual executable or service unit.
+
+A configured executable that gets replaced in place (a routine package
+upgrade) does not drop the gate: the mark is re-armed on the new inode and
+the pause stays in effect.  The gate only deactivates -- reporting unhealthy
+and releasing whatever it currently holds -- when a target disappears
+entirely or the re-arm itself fails.  A rejected reconfigure (bad target,
+duplicate id) never releases processes queued under the previous, still
+valid configuration.
+"""
+
+import argparse
+import ctypes
+import ctypes.util
+import errno
+import json
+import os
+import selectors
+import signal
+import socket
+import stat
+import struct
+import time
+
+
+FAN_CLASS_PRE_CONTENT = 0x00000008
+FAN_CLOEXEC = 0x00000001
+FAN_NONBLOCK = 0x00000002
+FAN_MARK_ADD = 0x00000001
+FAN_MARK_REMOVE = 0x00000002
+FAN_OPEN_EXEC_PERM = 0x00040000
+FAN_ALLOW = 0x01
+FAN_Q_OVERFLOW = 0x00004000
+FAN_EVENT_METADATA_LEN = 24
+FANOTIFY_METADATA_VERSION = 3
+AT_FDCWD = -100
+
+DEFAULT_SOCKET = "/run/loadshed/gate.sock"
+DEFAULT_STATE = "/run/loadshed/gate-state.json"
+
+
+class GateError(Exception):
+    pass
+
+
+class Fanotify:
+    def __init__(self):
+        library = ctypes.util.find_library("c") or "libc.so.6"
+        self._libc = ctypes.CDLL(library, use_errno=True)
+        self._libc.fanotify_init.argtypes = [ctypes.c_uint, ctypes.c_uint]
+        self._libc.fanotify_init.restype = ctypes.c_int
+        self._libc.fanotify_mark.argtypes = [
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_uint64,
+            ctypes.c_int,
+            ctypes.c_char_p,
+        ]
+        self._libc.fanotify_mark.restype = ctypes.c_int
+        flags = FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC | FAN_NONBLOCK
+        event_flags = os.O_RDONLY | getattr(os, "O_LARGEFILE", 0)
+        fd = self._libc.fanotify_init(flags, event_flags)
+        if fd < 0:
+            error = ctypes.get_errno()
+            raise GateError(f"fanotify_init failed: {os.strerror(error)}")
+        self.fd = fd
+
+    def mark(self, path, add=True):
+        flags = FAN_MARK_ADD if add else FAN_MARK_REMOVE
+        result = self._libc.fanotify_mark(
+            self.fd,
+            flags,
+            FAN_OPEN_EXEC_PERM,
+            AT_FDCWD,
+            os.fsencode(path),
+        )
+        if result < 0:
+            error = ctypes.get_errno()
+            raise GateError(
+                f"fanotify_mark {'add' if add else 'remove'} failed for {path}: "
+                f"{os.strerror(error)}"
+            )
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+class LoadshedGate:
+    def __init__(self, socket_path=DEFAULT_SOCKET, state_path=DEFAULT_STATE):
+        self.socket_path = socket_path
+        self.state_path = state_path
+        self.fanotify = Fanotify()
+        self.listener = None
+        self.selector = selectors.DefaultSelector()
+        self.active = False
+        self.generation = 0
+        self.targets = {}
+        self.queued = []
+        self.error = None
+        self._stop = False
+        self._last_identity_check = 0.0
+        self._restore_state()
+
+    @staticmethod
+    def _normalize_target(raw):
+        if not isinstance(raw, dict):
+            raise GateError("gate target must be an object")
+        target_id = raw.get("id")
+        executable = raw.get("executable")
+        if not isinstance(target_id, str) or not target_id:
+            raise GateError("gate target id is missing")
+        if not isinstance(executable, str) or not executable.startswith("/") or "\x00" in executable:
+            raise GateError(f"gate target has invalid executable: {executable!r}")
+        path = os.path.realpath(os.path.normpath(executable))
+        try:
+            target_stat = os.stat(path)
+        except OSError as exc:
+            raise GateError(f"executable not found: {path}") from exc
+        if not stat.S_ISREG(target_stat.st_mode) or not os.access(path, os.X_OK):
+            raise GateError(f"executable is not executable: {path}")
+        return target_id, {
+            "executable": path,
+            "device": target_stat.st_dev,
+            "inode": target_stat.st_ino,
+        }
+
+    def _write_state(self):
+        os.makedirs(os.path.dirname(self.state_path), mode=0o755, exist_ok=True)
+        state = {
+            "paused": self.active,
+            "generation": self.generation,
+            "targets": [
+                {"id": target_id, "executable": target["executable"]}
+                for target_id, target in sorted(self.targets.items())
+            ],
+        }
+        temporary = f"{self.state_path}.tmp.{os.getpid()}"
+        with open(temporary, "w", encoding="utf-8") as state_file:
+            json.dump(state, state_file, sort_keys=True, separators=(",", ":"))
+            state_file.write("\n")
+        os.chown(temporary, 0, 0)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.state_path)
+
+    def _restore_state(self):
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return
+        if not isinstance(state, dict) or not state.get("paused"):
+            return
+        try:
+            self._set_targets(state.get("targets", []))
+            self.generation = int(state.get("generation", 0))
+            self.active = True
+        except (GateError, ValueError) as exc:
+            self.error = f"failed to restore gate state: {exc}"
+            self.active = False
+
+    def _set_targets(self, raw_targets):
+        requested = {}
+        for raw_target in raw_targets:
+            target_id, target = self._normalize_target(raw_target)
+            if target_id in requested:
+                raise GateError(f"duplicate gate target id: {target_id}")
+            if any(
+                existing["executable"] == target["executable"]
+                for existing in requested.values()
+            ):
+                raise GateError(f"duplicate gate executable: {target['executable']}")
+            requested[target_id] = target
+
+        old_by_path = {target["executable"]: target for target in self.targets.values()}
+        new_by_path = {target["executable"]: target for target in requested.values()}
+        add_paths = set(new_by_path) - set(old_by_path)
+        removed_paths = set(old_by_path) - set(new_by_path)
+        remark_paths = {
+            path
+            for path in set(new_by_path) & set(old_by_path)
+            if (old_by_path[path]["device"], old_by_path[path]["inode"])
+            != (new_by_path[path]["device"], new_by_path[path]["inode"])
+        }
+
+        # Do the ADDs first: they are the only step that can fail here, and
+        # a failure must not have touched anything yet.  If one fails,
+        # unmark only the paths *this call* newly added -- a remark leaves
+        # a still-configured path strictly more protected than before, so
+        # it stays even though the call as a whole is failing.
+        newly_marked = []
+        try:
+            for path in sorted(add_paths | remark_paths):
+                self.fanotify.mark(path, add=True)
+                newly_marked.append(path)
+        except GateError:
+            for path in reversed(newly_marked):
+                if path not in add_paths:
+                    continue
+                try:
+                    self.fanotify.mark(path, add=False)
+                except GateError:
+                    pass
+            raise
+
+        # Only after every ADD succeeded: drop what is no longer
+        # configured.  A replaced inode can make the old path unmarkable
+        # (GateError) -- that's fine, the new content at that path was
+        # simply never a target.
+        if removed_paths:
+            self._release_queued(removed_paths)
+        for path in sorted(removed_paths):
+            try:
+                self.fanotify.mark(path, add=False)
+            except GateError:
+                pass
+
+        self.targets = requested
+        self.error = None
+
+    # Note: there used to be a _reopen_fanotify() helper here that replaced
+    # self.fanotify with a fresh Fanotify() group.  It was removed: closing
+    # a fanotify group makes the kernel answer FAN_ALLOW to every event
+    # still pending on it -- an invisible global release of every blocked
+    # process, exactly what TODO(human) below must not do.  It also never
+    # re-registered the new fd with the selector in serve() (Z. 390), so a
+    # runtime reopen silently killed the event loop.  Re-arming a mark now
+    # always happens on the live group via fanotify.mark(path, add=True).
+
+    def _remark_target(self, target, target_stat=None):
+        """Re-arm the fanotify mark for target["executable"] on its current inode.
+
+        fanotify_mark(..., FAN_MARK_ADD, ..., path) marks whatever inode the
+        path resolves to *at call time* -- the mark then follows the inode,
+        not the path.  So re-adding a mark on the same path automatically
+        picks up a package upgrade's replacement binary; no matching REMOVE
+        is needed (the path no longer points at the old inode anyway, and
+        removing by path would race against yet another replacement).  The
+        old inode's mark goes stale and is reclaimed only when this
+        fanotify group is closed -- harmless against the default
+        fs.fanotify.max_user_marks limit.
+        """
+        path = target["executable"]
+        if target_stat is None:
+            target_stat = os.stat(path)
+        if not stat.S_ISREG(target_stat.st_mode) or not os.access(path, os.X_OK):
+            raise GateError(f"executable is not executable: {path}")
+        self.fanotify.mark(path, add=True)
+        target["device"] = target_stat.st_dev
+        target["inode"] = target_stat.st_ino
+
+    def _deactivate(self, message):
+        self.error = message
+        self.active = False
+        self._release_queued()
+        self._write_state()
+
+    def configure(self, request):
+        if not request.get("paused"):
+            raise GateError("configure requires paused=true")
+        generation = int(request.get("generation", 0))
+        try:
+            self._set_targets(request.get("targets", []))
+        except GateError as exc:
+            # A rejected reconfigure (bad target, duplicate id, ...) must
+            # not drop protection for the targets that were already active.
+            # _set_targets() validates before touching any marks, so the
+            # previously configured targets and their queued processes are
+            # untouched here -- leave them alone.
+            #
+            # Still adopt the requested generation: the caller (loadshed-
+            # helper) already persisted it before this call, so a later
+            # release() for that generation must not hit a mismatch and
+            # get stuck unable to free the still-queued processes.
+            self.error = str(exc)
+            self.generation = generation
+            self._write_state()
+            raise
+        self.generation = generation
+        self.active = True
+        self.error = None
+        self._write_state()
+        return self.status()
+
+    def _respond(self, event_fd, response=FAN_ALLOW):
+        try:
+            os.write(self.fanotify.fd, struct.pack("iI", event_fd, response))
+        except OSError as exc:
+            if exc.errno not in (errno.EBADF, errno.EPIPE):
+                self.error = f"fanotify response failed: {exc}"
+        try:
+            os.close(event_fd)
+        except OSError:
+            pass
+
+    def _release_queued(self, paths=None):
+        queued, self.queued = self.queued, []
+        for queued_event in queued:
+            if isinstance(queued_event, tuple):
+                event_fd, event_path = queued_event
+            else:
+                event_fd, event_path = queued_event, None
+            if paths is not None and event_path not in paths:
+                self.queued.append(queued_event)
+                continue
+            self._respond(event_fd)
+
+    def release(self, request):
+        generation = int(request.get("generation", self.generation))
+        if generation != self.generation:
+            raise GateError(
+                f"generation mismatch: gate={self.generation}, request={generation}"
+            )
+        self.active = False
+        self._release_queued()
+        self._write_state()
+        return self.status()
+
+    def _read_events(self):
+        try:
+            data = os.read(self.fanotify.fd, 1024 * 1024)
+        except BlockingIOError:
+            return
+        except OSError as exc:
+            self.error = f"fanotify read failed: {exc}"
+            return
+
+        offset = 0
+        while offset + FAN_EVENT_METADATA_LEN <= len(data):
+            # struct fanotify_event_metadata: event_len, vers, reserved,
+            # metadata_len, mask, fd, pid.  The reserved byte must still be
+            # unpacked (as _reserved) even though it is unused -- dropping
+            # it here previously left 7 packed values for 6 names, which
+            # raised ValueError on every real fanotify event.
+            event_len, version, _reserved, metadata_len, mask, event_fd, _pid = (
+                struct.unpack_from("I B B H Q i i", data, offset)
+            )
+            if event_len < FAN_EVENT_METADATA_LEN or offset + event_len > len(data):
+                self.error = "invalid fanotify event metadata"
+                # The fixed-size header (including event_fd) was still read
+                # from a well-formed offset even though event_len itself
+                # looks wrong; answer it so the caller doesn't hang in
+                # execve() forever over a read we can't safely continue
+                # parsing.
+                if event_fd >= 0:
+                    self._respond(event_fd)
+                return
+            if version != FANOTIFY_METADATA_VERSION or metadata_len < FAN_EVENT_METADATA_LEN:
+                self.error = "unsupported fanotify event metadata"
+                if event_fd >= 0:
+                    self._respond(event_fd)
+                return
+            if mask & FAN_Q_OVERFLOW:
+                self.error = "fanotify queue overflow"
+            elif event_fd >= 0 and mask & FAN_OPEN_EXEC_PERM:
+                if self.active:
+                    try:
+                        event_path = os.readlink(f"/proc/self/fd/{event_fd}")
+                    except OSError:
+                        event_path = None
+                    if event_path and event_path.endswith(" (deleted)"):
+                        event_path = event_path[:-10]
+                    self.queued.append((event_fd, event_path))
+                else:
+                    self._respond(event_fd)
+            offset += event_len
+
+    def _check_target_identity(self):
+        if not self.active:
+            return
+        now = time.monotonic()
+        if now - self._last_identity_check < 1.0:
+            return
+        self._last_identity_check = now
+        for target in self.targets.values():
+            try:
+                target_stat = os.stat(target["executable"])
+            except OSError as exc:
+                self._deactivate(
+                    f"configured executable disappeared: {target['executable']} ({exc})"
+                )
+                return
+            if (target_stat.st_dev, target_stat.st_ino) == (target["device"], target["inode"]):
+                continue
+            # The executable was replaced in place (a routine package
+            # upgrade).  Re-arm the mark on the new inode instead of
+            # dropping the gate -- the fanotify group already reflects the
+            # new binary, so a running enforce cycle should not lose
+            # coverage over a package update.  stat() happened above,
+            # before the mark: if the file is replaced again in the
+            # meantime, the recorded inode is stale and the next check
+            # re-marks again, so this converges instead of getting stuck on
+            # a version that no longer matches.
+            try:
+                self._remark_target(target, target_stat)
+            except (GateError, OSError) as exc:
+                self._deactivate(
+                    f"configured executable was replaced and could not be "
+                    f"re-marked: {target['executable']} ({exc})"
+                )
+                return
+
+    def status(self):
+        return {
+            "ok": True,
+            "healthy": self.error is None,
+            "active": self.active,
+            "generation": self.generation,
+            "queued_exec_count": len(self.queued),
+            "targets": [
+                {"id": target_id, "executable": target["executable"]}
+                for target_id, target in sorted(self.targets.items())
+            ],
+            "error": self.error,
+        }
+
+    def _reply(self, connection, payload):
+        connection.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+
+    def _handle_connection(self, connection):
+        try:
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            if not data:
+                return
+            request = json.loads(data.decode())
+            command = request.get("command")
+            if command == "configure":
+                payload = self.configure(request)
+            elif command == "release":
+                payload = self.release(request)
+            elif command == "status":
+                payload = self.status()
+            else:
+                raise GateError(f"unknown gate command: {command!r}")
+            self._reply(connection, payload)
+        except (GateError, OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            try:
+                self._reply(connection, {"ok": False, "error": str(exc)})
+            except OSError:
+                pass
+
+    def serve(self):
+        os.makedirs(os.path.dirname(self.socket_path), mode=0o755, exist_ok=True)
+        try:
+            os.unlink(self.socket_path)
+        except FileNotFoundError:
+            pass
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(self.socket_path)
+        os.chown(self.socket_path, 0, 0)
+        os.chmod(self.socket_path, 0o600)
+        self.listener.listen(16)
+        self.listener.setblocking(False)
+        self.selector.register(self.listener, selectors.EVENT_READ, "listener")
+        self.selector.register(self.fanotify.fd, selectors.EVENT_READ, "fanotify")
+
+        while not self._stop:
+            self._check_target_identity()
+            for key, _mask in self.selector.select(timeout=0.5):
+                if key.data == "listener":
+                    connection, _ = self.listener.accept()
+                    with connection:
+                        self._handle_connection(connection)
+                else:
+                    self._read_events()
+
+    def stop(self, *_args):
+        self._stop = True
+        self.active = False
+        self._release_queued()
+
+    def close(self):
+        self._release_queued()
+        if self.listener is not None:
+            try:
+                self.selector.unregister(self.listener)
+            except Exception:
+                pass
+            self.listener.close()
+        try:
+            os.unlink(self.socket_path)
+        except FileNotFoundError:
+            pass
+        self.fanotify.close()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--socket", default=DEFAULT_SOCKET)
+    parser.add_argument("--state", default=DEFAULT_STATE)
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args(argv)
+    if args.check:
+        try:
+            fanotify = Fanotify()
+            fanotify.close()
+            return 0
+        except GateError as exc:
+            print(f"loadshed-gate: {exc}", file=os.sys.stderr)
+            return 1
+
+    gate = None
+    try:
+        gate = LoadshedGate(args.socket, args.state)
+        signal.signal(signal.SIGTERM, gate.stop)
+        signal.signal(signal.SIGINT, gate.stop)
+        gate.serve()
+        return 0
+    except GateError as exc:
+        print(f"loadshed-gate: {exc}", file=os.sys.stderr)
+        return 1
+    finally:
+        if gate is not None:
+            gate.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

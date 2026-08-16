@@ -1,0 +1,27 @@
+[Unit]
+Description=Loadshed executable start gate
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/loadshed-gate
+Restart=on-failure
+RestartSec=1s
+User=root
+Group=root
+RuntimeDirectory=loadshed
+RuntimeDirectoryMode=0755
+ExecStartPre=/usr/local/libexec/loadshed-gate --check
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN
+NoNewPrivileges=yes
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/loadshed
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

@@ -8,8 +8,9 @@ La extensión delega el trabajo privilegiado en `/usr/local/bin/loadshed-helper`
 El helper lee y escribe unidades propiedad de root en `/etc/loadshed/units.json` y usa
 `systemctl freeze`/`systemctl thaw` para los servicios. Los temporizadores configurados junto a un
 servicio se detienen durante la pausa y solo se reinician si el helper los detuvo. Mientras el botón
-de los ajustes rápidos está pausado, las actualizaciones vuelven a aplicar ese estado a los servicios
-configurados que arranquen más tarde.
+está pausado, `loadshed-gate`, propiedad de root, retiene en `execve()` los inicios directos de los
+ejecutables configurados mediante eventos Linux `FAN_OPEN_EXEC_PERM`, hasta reanudar. La intención de
+pausa se conserva incluso si no había ningún proceso coincidente al activarla.
 
 ## Capturas de pantalla
 
@@ -67,6 +68,28 @@ que los errores sigan visibles en el menú. Formato de entrada:
   }
 ]
 ```
+
+Los objetivos de proceso usan una ruta absoluta al ejecutable en lugar de un nombre de proceso:
+
+```json
+{
+  "id": "rsync",
+  "label": "rsync file sync",
+  "executable": "/usr/bin/rsync",
+  "optional": true
+}
+```
+
+Las entradas antiguas `process` se migran usando rutas de sistema fijas. Un ejecutable
+opcional que falta se omite silenciosamente, igual que un servicio opcional; si falta
+un ejecutable no opcional o la resolución es ambigua, la pausa se rechaza con un error
+explícito. La versión 1 solo garantiza inicios directos del ejecutable configurado;
+scripts interpretados, procesos dentro de contenedores y hardlinks no configurados
+quedan fuera de esta garantía. Si el ejecutable se reemplaza en el mismo lugar (una
+actualización de paquete normal), el gate reajusta su protección al nuevo binario sin
+levantar la pausa. Si el gate no está disponible, los objetivos afectados siguen
+pausados mediante SIGSTOP/freeze, pero el estado informa de una pausa no estricta en
+lugar de una pausa estricta.
 
 Los daemons de Snap son unidades systemd normales y también pueden añadirse aquí. Snap suele exponer
 un daemon como `snap.<snap-name>.<service-name>.service`. Usa el nombre exacto de la unidad mostrado

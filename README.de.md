@@ -8,8 +8,9 @@ Die Erweiterung delegiert privilegierte Arbeit an `/usr/local/bin/loadshed-helpe
 Der Helper liest und schreibt root-eigene Units in `/etc/loadshed/units.json` und nutzt
 `systemctl freeze`/`systemctl thaw` für Dienste. Timer, die neben einem Dienst konfiguriert sind,
 werden während der Pause gestoppt und nur dann neu gestartet, wenn der Helper sie selbst gestoppt hat.
-Solange der Schalter in den Schnelleinstellungen pausiert ist, erzwingen Aktualisierungen diesen
-Zustand erneut für konfigurierte Dienste, die später starten.
+Solange der Schalter pausiert ist, hält der root-eigene `loadshed-gate` direkte Starts
+konfigurierter Executables über Linux-`FAN_OPEN_EXEC_PERM` in `execve()` zurück, bis fortgesetzt wird.
+Der Pause-Intent bleibt auch erhalten, wenn beim Aktivieren kein passender Prozess lief.
 
 ## Bildschirmfotos
 
@@ -67,6 +68,28 @@ damit Fehler im Menü sichtbar bleiben. Eintragsformat:
   }
 ]
 ```
+
+Prozessziele verwenden einen absoluten Executable-Pfad statt eines Prozessnamens:
+
+```json
+{
+  "id": "rsync",
+  "label": "rsync file sync",
+  "executable": "/usr/bin/rsync",
+  "optional": true
+}
+```
+
+Alte `process`-Einträge werden über feste Systempfade migriert. Ein fehlendes optionales
+Executable wird still übersprungen, genau wie ein optionaler Dienst; fehlt ein
+nicht-optionales oder mehrdeutiges Executable, wird die Pause mit einem klaren Fehler
+abgelehnt. Version 1 garantiert nur direkte Starts des konfigurierten Executables;
+Interpreter-Skripte, Prozesse in Containern und nicht konfigurierte Hardlinks liegen
+außerhalb dieser Garantie. Wird das Executable an Ort und Stelle ersetzt (ein normales
+Paket-Update), stellt der Gate seinen Schutz auf die neue Datei um, ohne die Pause
+aufzuheben. Ist der Gate nicht erreichbar, bleiben die betroffenen Ziele weiterhin über
+SIGSTOP/Freeze pausiert, aber der Status meldet eine nicht-strikte statt einer harten
+Pause.
 
 Snap-Daemons sind normale systemd-Units und können hier ebenfalls hinzugefügt werden. Snap stellt
 einen Daemon normalerweise als `snap.<snap-name>.<service-name>.service` bereit. Verwende den exakten

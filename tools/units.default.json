@@ -128,7 +128,7 @@
   {
     "id": "rsync",
     "label": "rsync file sync",
-    "process": "rsync",
+    "executable": "/usr/bin/rsync",
     "optional": true
   }
 ]
