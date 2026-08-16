@@ -27,6 +27,16 @@ def unit(entry_id, service=None, timer=None, enabled=True):
     }
 
 
+def process(entry_id, name=None, enabled=True):
+    return {
+        "id": entry_id,
+        "label": entry_id.upper(),
+        "process": name or entry_id,
+        "optional": False,
+        "enabled": enabled,
+    }
+
+
 def state_entry(entry_id, service=None, timer=None):
     return {
         "service": service or f"{entry_id}.service",
@@ -184,6 +194,89 @@ class LoadshedHelperTests(unittest.TestCase):
         self.assertEqual(result, 0)
         save_config.assert_called_once_with(new_units)
         pause_units.assert_called_once_with(new_units)
+
+    def test_process_entry_validates_and_serializes(self):
+        entries = helper.validate_units([{
+            "id": "rsync",
+            "label": "rsync file sync",
+            "process": "rsync",
+            "optional": True,
+        }])
+
+        self.assertEqual(entries, [process("rsync", name="rsync") | {"label": "rsync file sync", "optional": True}])
+        self.assertEqual(helper.serialize_units(entries), [{
+            "id": "rsync",
+            "label": "rsync file sync",
+            "process": "rsync",
+            "optional": True,
+        }])
+
+    def test_pause_units_stops_matching_process(self):
+        current_state = {"entries": {}}
+        saved = []
+        stopped = []
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "save_state", side_effect=saved.append),
+            mock.patch.object(helper, "find_processes", return_value=[{"pid": 123, "start_time": "42", "state": "S"}]),
+            mock.patch.object(helper, "stop_process", side_effect=lambda pid, name, start: stopped.append((pid, name, start))),
+        ):
+            errors = helper.pause_units([process("rsync")])
+
+        self.assertEqual(errors, [])
+        self.assertEqual(stopped, [(123, "rsync", "42")])
+        self.assertTrue(saved[0]["entries"]["rsync"]["process_stopped"])
+        self.assertEqual(saved[0]["entries"]["rsync"]["processes"]["123"]["start_time"], "42")
+
+    def test_pause_units_keeps_progress_when_one_process_stop_fails(self):
+        current_state = {"entries": {}}
+        saved = []
+
+        def failing_stop(pid, name, start):
+            if pid == 222:
+                raise OSError("permission denied")
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "save_state", side_effect=saved.append),
+            mock.patch.object(helper, "find_processes", return_value=[
+                {"pid": 111, "start_time": "10", "state": "S"},
+                {"pid": 222, "start_time": "20", "state": "S"},
+            ]),
+            mock.patch.object(helper, "stop_process", side_effect=failing_stop),
+        ):
+            errors = helper.pause_units([process("rsync")])
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("222", errors[0])
+        entry_state = saved[0]["entries"]["rsync"]
+        self.assertTrue(entry_state["process_stopped"])
+        self.assertEqual(list(entry_state["processes"]), ["111"])
+
+    def test_resume_units_continues_tracked_process(self):
+        current_state = {
+            "entries": {
+                "rsync": {
+                    "process": "rsync",
+                    "process_stopped": True,
+                    "processes": {"123": {"start_time": "42", "process": "rsync"}},
+                }
+            }
+        }
+        saved = []
+        continued = []
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "save_state", side_effect=saved.append),
+            mock.patch.object(helper, "continue_process", side_effect=lambda pid, name, start: continued.append((pid, name, start))),
+        ):
+            errors = helper.resume_units([process("rsync")])
+
+        self.assertEqual(errors, [])
+        self.assertEqual(continued, [(123, "rsync", "42")])
+        self.assertEqual(saved, [{"entries": {}}])
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ const CONFIG_PATH = '/etc/loadshed/units.json';
 const VALID_ID_RE = /^[A-Za-z0-9_.@:-]+$/;
 const VALID_SERVICE_RE = /^[A-Za-z0-9_.@:-]+\.service$/;
 const VALID_TIMER_RE = /^[A-Za-z0-9_.@:-]+\.timer$/;
+const VALID_PROCESS_RE = /^[A-Za-z0-9_.@:+-]+$/;
 const VALID_APP_KIND_RE = /^(flatpak|snap)$/;
 const VALID_APP_ID_RE = /^[A-Za-z0-9_.@:-]+$/;
 const APP_TARGET_KINDS = ['flatpak', 'snap'];
@@ -93,6 +94,10 @@ class HelperClient {
 }
 
 function unitSubtitle(entry, gettext) {
+    if (entry.process) {
+        return `process: ${entry.process}`;
+    }
+
     if (!entry.service) {
         return gettext('No service unit');
     }
@@ -378,7 +383,6 @@ export default class LoadshedPrefs extends ExtensionPreferences {
 
     _restoreCatalog() {
         const entries = this._rawEntriesFromRows();
-        const seen = new Set(entries.map(entry => entry.service).filter(Boolean));
         let changed = 0;
 
         this._setBusy(true);
@@ -391,7 +395,7 @@ export default class LoadshedPrefs extends ExtensionPreferences {
 
                 this._defaultEntries.forEach(defaultEntry => {
                     const enabled = Boolean(this._defaultStatusById.get(defaultEntry.id)?.recommended_enabled);
-                    const existingEntry = entries.find(entry => entry.service === defaultEntry.service);
+                    const existingEntry = entries.find(entry => this._entryTargetKey(entry) === this._entryTargetKey(defaultEntry));
 
                     if (existingEntry) {
                         if (existingEntry.enabled !== enabled) {
@@ -404,7 +408,6 @@ export default class LoadshedPrefs extends ExtensionPreferences {
 
                     entries.push({ ...defaultEntry, optional: true, enabled });
                     changed += 1;
-                    seen.add(defaultEntry.service);
                 });
 
                 this._entries = entries;
@@ -453,6 +456,10 @@ export default class LoadshedPrefs extends ExtensionPreferences {
                     title: this._('Timer unit (optional)'),
                     text: entry.timer || '',
                 });
+                const processRow = new Adw.EntryRow({
+                    title: this._('Process name'),
+                    text: entry.process || '',
+                });
                 const enabledRow = new Adw.ActionRow({
                     title: this._('Use with pause button'),
                     subtitle: this._entryAvailabilitySubtitle(entry),
@@ -471,21 +478,24 @@ export default class LoadshedPrefs extends ExtensionPreferences {
                 row.add_row(labelRow);
                 row.add_row(serviceRow);
                 row.add_row(timerRow);
+                row.add_row(processRow);
                 row.add_row(enabledRow);
                 row.add_row(removeRow);
 
-                const controls = { row, labelRow, serviceRow, timerRow, enabledSwitch, entry };
+                const controls = { row, labelRow, serviceRow, timerRow, processRow, enabledSwitch, entry };
                 const syncTitle = () => {
                     row.title = labelRow.text.trim() || this._('Unnamed service');
                     row.subtitle = unitSubtitle({
                         service: serviceRow.text.trim(),
                         timer: timerRow.text.trim(),
+                        process: processRow.text.trim(),
                     }, this._);
                 };
 
                 labelRow.connect('changed', syncTitle);
                 serviceRow.connect('changed', syncTitle);
                 timerRow.connect('changed', syncTitle);
+                processRow.connect('changed', syncTitle);
 
                 this._servicesListGroup.add(row);
                 this._serviceRows.push(controls);
@@ -510,6 +520,7 @@ export default class LoadshedPrefs extends ExtensionPreferences {
                 label: controls.labelRow.text.trim(),
                 service: controls.serviceRow.text.trim(),
                 timer: controls.timerRow.text.trim() || null,
+                process: controls.processRow.text.trim(),
                 optional: Boolean(controls.entry.optional),
                 enabled: controls.enabledSwitch?.active ?? true,
             }));
@@ -518,7 +529,7 @@ export default class LoadshedPrefs extends ExtensionPreferences {
     _collectEntries() {
         const errors = [];
         const entries = [];
-        const seenServices = new Set();
+        const seenTargets = new Set();
         const usedIds = new Set();
 
         this._serviceRows
@@ -527,36 +538,57 @@ export default class LoadshedPrefs extends ExtensionPreferences {
                 const label = controls.labelRow.text.trim();
                 const service = controls.serviceRow.text.trim();
                 const timer = controls.timerRow.text.trim();
-                const rowName = label || service || `${this._('Service')} ${index + 1}`;
+                const process = controls.processRow.text.trim();
+                const rowName = label || service || process || `${this._('Service')} ${index + 1}`;
 
-                if (!label && !service && !timer) {
+                if (!label && !service && !timer && !process) {
                     return;
                 }
                 if (!label) {
                     errors.push(`${this._('Label is required')}: ${rowName}`);
                 }
-                if (!service) {
-                    errors.push(`${this._('Service unit is required')}: ${rowName}`);
-                } else if (!VALID_SERVICE_RE.test(service)) {
+                if (service && process) {
+                    errors.push(`${this._('Use either a service unit or a process name')}: ${rowName}`);
+                }
+                if (!service && !process) {
+                    errors.push(`${this._('Service unit or process name is required')}: ${rowName}`);
+                }
+                if (service && !VALID_SERVICE_RE.test(service)) {
                     errors.push(`${this._('Service unit must end in .service')}: ${service}`);
-                } else if (seenServices.has(service)) {
-                    errors.push(`${this._('Duplicate service unit')}: ${service}`);
+                }
+                if (process && !VALID_PROCESS_RE.test(process)) {
+                    errors.push(`${this._('Invalid process name')}: ${process}`);
+                }
+                const targetKey = service ? `service:${service}` : `process:${process}`;
+                if ((service || process) && seenTargets.has(targetKey)) {
+                    errors.push(`${this._('Duplicate target')}: ${service || process}`);
                 }
                 if (timer && !VALID_TIMER_RE.test(timer)) {
                     errors.push(`${this._('Timer unit must end in .timer')}: ${timer}`);
                 }
+                if (timer && process) {
+                    errors.push(`${this._('Process entries cannot use timers')}: ${rowName}`);
+                }
 
-                if (!label || !service || !VALID_SERVICE_RE.test(service) || (timer && !VALID_TIMER_RE.test(timer))) {
+                if (!label || (service && process) || (!service && !process) ||
+                    (service && !VALID_SERVICE_RE.test(service)) ||
+                    (process && !VALID_PROCESS_RE.test(process)) ||
+                    (timer && (!VALID_TIMER_RE.test(timer) || process))) {
                     return;
                 }
 
-                seenServices.add(service);
-                const id = this._entryId(controls.entry, service, usedIds);
-                const optional = this._isOptionalDefault(controls.entry, service, timer);
+                seenTargets.add(targetKey);
+                const id = this._entryId(controls.entry, service || process, usedIds);
+                const optional = this._isOptionalDefault(controls.entry, service, timer, process);
                 const enabled = controls.enabledSwitch?.active ?? true;
-                const entry = { id, label, service };
+                const entry = { id, label };
 
-                if (timer) {
+                if (service) {
+                    entry.service = service;
+                } else {
+                    entry.process = process;
+                }
+                if (timer && service) {
                     entry.timer = timer;
                 }
                 if (optional) {
@@ -592,15 +624,28 @@ export default class LoadshedPrefs extends ExtensionPreferences {
         return id;
     }
 
-    _isOptionalDefault(sourceEntry, service, timer) {
+    _isOptionalDefault(sourceEntry, service, timer, process) {
         const defaultEntry = this._defaultsById.get(sourceEntry.id);
         if (defaultEntry) {
-            return defaultEntry.service === service && (defaultEntry.timer || '') === (timer || '');
+            return (defaultEntry.service || '') === (service || '') &&
+                (defaultEntry.process || '') === (process || '') &&
+                (defaultEntry.timer || '') === (timer || '');
         }
 
         return Boolean(sourceEntry.optional) &&
-            sourceEntry.service === service &&
+            (sourceEntry.service || '') === (service || '') &&
+            (sourceEntry.process || '') === (process || '') &&
             (sourceEntry.timer || '') === (timer || '');
+    }
+
+    _entryTargetKey(entry) {
+        if (entry?.service) {
+            return `service:${entry.service}`;
+        }
+        if (entry?.process) {
+            return `process:${entry.process}`;
+        }
+        return '';
     }
 
     _entryAvailabilitySubtitle(entry) {

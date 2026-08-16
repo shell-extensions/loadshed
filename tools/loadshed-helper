@@ -17,10 +17,12 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import errno
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -34,6 +36,7 @@ CGROUP_ROOT = "/sys/fs/cgroup"
 
 VALID_ID_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 VALID_UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:\\-]+\.(service|timer)$")
+VALID_PROCESS_RE = re.compile(r"^[A-Za-z0-9_.@:+-]+$")
 
 
 class LoadshedError(Exception):
@@ -82,6 +85,7 @@ def validate_entry(raw, index):
     label = raw.get("label")
     service = raw.get("service")
     timer = raw.get("timer")
+    process = raw.get("process")
     optional = raw.get("optional", False)
     enabled = raw.get("enabled", True)
 
@@ -89,28 +93,48 @@ def validate_entry(raw, index):
         raise LoadshedError(f"invalid id in unit entry #{index + 1}")
     if not isinstance(label, str) or not label.strip():
         raise LoadshedError(f"invalid label in unit entry {entry_id}")
-    if not isinstance(service, str):
+    if service is not None and not isinstance(service, str):
         raise LoadshedError(f"invalid service in unit entry {entry_id}")
+    if process is not None and not isinstance(process, str):
+        raise LoadshedError(f"invalid process in unit entry {entry_id}")
     if not isinstance(optional, bool):
         raise LoadshedError(f"invalid optional flag in unit entry {entry_id}")
     if not isinstance(enabled, bool):
         raise LoadshedError(f"invalid enabled flag in unit entry {entry_id}")
 
     entry_id = entry_id.strip()
-    service = validate_unit_name(service.strip(), ".service")
+    if service is not None:
+        service = service.strip() or None
+    if process is not None:
+        process = process.strip() or None
+    if not service and not process:
+        raise LoadshedError(f"unit entry {entry_id} needs a service or process")
+    if service and process:
+        raise LoadshedError(f"unit entry {entry_id} cannot mix service and process")
+
+    if service:
+        service = validate_unit_name(service, ".service")
+    if process and not VALID_PROCESS_RE.match(process):
+        raise LoadshedError(f"invalid process name in unit entry {entry_id}: {process!r}")
     if isinstance(timer, str):
         timer = timer.strip() or None
     if timer is not None:
+        if not service:
+            raise LoadshedError(f"process entry {entry_id} cannot use a timer")
         timer = validate_unit_name(timer, ".timer")
 
-    return {
+    entry = {
         "id": entry_id,
         "label": label.strip(),
-        "service": service,
-        "timer": timer,
         "optional": optional,
         "enabled": enabled,
     }
+    if service:
+        entry["service"] = service
+        entry["timer"] = timer
+    else:
+        entry["process"] = process
+    return entry
 
 
 def validate_units(raw_units):
@@ -119,15 +143,22 @@ def validate_units(raw_units):
 
     units = [validate_entry(raw, index) for index, raw in enumerate(raw_units)]
     seen_ids = set()
-    seen_services = set()
+    seen_targets = set()
     for unit in units:
         if unit["id"] in seen_ids:
             raise LoadshedError(f"duplicate unit id: {unit['id']}")
-        if unit["service"] in seen_services:
-            raise LoadshedError(f"duplicate service unit: {unit['service']}")
+        target = target_key(unit)
+        if target in seen_targets:
+            raise LoadshedError(f"duplicate target: {target[1]}")
         seen_ids.add(unit["id"])
-        seen_services.add(unit["service"])
+        seen_targets.add(target)
     return units
+
+
+def target_key(unit):
+    if unit.get("service"):
+        return ("service", unit["service"])
+    return ("process", unit["process"])
 
 
 def load_units():
@@ -153,8 +184,11 @@ def serialize_units(units):
         entry = {
             "id": unit["id"],
             "label": unit["label"],
-            "service": unit["service"],
         }
+        if unit.get("service"):
+            entry["service"] = unit["service"]
+        else:
+            entry["process"] = unit["process"]
         if unit.get("timer"):
             entry["timer"] = unit["timer"]
         if unit.get("optional"):
@@ -282,7 +316,7 @@ def unit_loaded(status):
 
 
 def optional_service_missing(unit, managed_state=None):
-    if not unit.get("optional") or managed_state:
+    if not unit.get("service") or not unit.get("optional") or managed_state:
         return False
     return not unit_loaded(show_unit(unit["service"]))
 
@@ -292,6 +326,23 @@ def catalog_status_payload(units):
     entries = []
     for unit in units:
         managed_state = managed.get(unit["id"], {})
+        if unit.get("process"):
+            processes = find_processes(unit["process"])
+            managed_active = bool(managed_state.get("process_stopped"))
+            process_active = bool(processes)
+            entries.append({
+                "id": unit["id"],
+                "label": unit["label"],
+                "process": unit["process"],
+                "optional": unit.get("optional", False),
+                "available": True,
+                "process_active": process_active,
+                "process_count": len(processes),
+                "managed": managed_active,
+                "recommended_enabled": managed_active or process_active,
+            })
+            continue
+
         service_status = show_unit(unit["service"])
         timer_status = show_unit(unit["timer"]) if unit.get("timer") else {}
         service_loaded = unit_loaded(service_status)
@@ -404,6 +455,110 @@ def thaw_service(unit, method):
     systemctl(["thaw", unit], check=True)
 
 
+def proc_stat_start_time(pid):
+    try:
+        stat_text = PathLikeProc(pid, "stat").read_text()
+    except OSError:
+        return None
+
+    parts = stat_text.rsplit(") ", 1)
+    if len(parts) != 2:
+        return None
+    fields = parts[1].split()
+    if len(fields) < 20:
+        return None
+    return fields[19]
+
+
+class PathLikeProc:
+    def __init__(self, pid, name):
+        self.path = os.path.join("/proc", str(pid), name)
+
+    def read_text(self):
+        with open(self.path, "r", encoding="utf-8", errors="replace") as proc_file:
+            return proc_file.read()
+
+
+def proc_comm(pid):
+    try:
+        return PathLikeProc(pid, "comm").read_text().strip()
+    except OSError:
+        return None
+
+
+def proc_state(pid):
+    try:
+        status = PathLikeProc(pid, "status").read_text()
+    except OSError:
+        return None
+    for line in status.splitlines():
+        if line.startswith("State:"):
+            parts = line.split()
+            return parts[1] if len(parts) > 1 else None
+    return None
+
+
+def find_processes(process):
+    matches = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == os.getpid():
+            continue
+        if proc_comm(pid) != process:
+            continue
+        start_time = proc_stat_start_time(pid)
+        if start_time is None:
+            continue
+        matches.append({
+            "pid": pid,
+            "start_time": start_time,
+            "state": proc_state(pid),
+        })
+    return matches
+
+
+def process_is_same(pid, process, start_time):
+    return proc_comm(pid) == process and proc_stat_start_time(pid) == start_time
+
+
+def stop_process(pid, process, start_time):
+    if process_is_same(pid, process, start_time):
+        os.kill(pid, signal.SIGSTOP)
+
+
+def continue_process(pid, process, start_time):
+    if process_is_same(pid, process, start_time):
+        os.kill(pid, signal.SIGCONT)
+
+
+def pause_process(unit, entry_state, errors):
+    process = unit["process"]
+    processes = {
+        str(pid): proc
+        for pid, proc in (entry_state.get("processes") or {}).items()
+        if process_is_same(int(pid), process, str(proc.get("start_time")))
+    }
+
+    for proc in find_processes(process):
+        pid_key = str(proc["pid"])
+        if proc.get("state") != "T":
+            try:
+                stop_process(proc["pid"], process, proc["start_time"])
+            except OSError as exc:
+                errors.append(f"{unit['label']}: failed to stop pid {proc['pid']}: {exc}")
+                continue
+        processes[pid_key] = {
+            "start_time": proc["start_time"],
+            "process": process,
+        }
+
+    entry_state["processes"] = processes
+    entry_state["process_stopped"] = bool(processes)
+    return entry_state
+
+
 def pause_units(units):
     state = load_state()
     entries = state.setdefault("entries", {})
@@ -411,6 +566,20 @@ def pause_units(units):
 
     for unit in units:
         if optional_service_missing(unit, entries.get(unit["id"])):
+            continue
+
+        if unit.get("process"):
+            entry_state = entries.get(unit["id"], {
+                "process": unit["process"],
+                "process_stopped": False,
+                "processes": {},
+            })
+            entry_state = pause_process(unit, entry_state, errors)
+
+            if entry_state.get("process_stopped"):
+                entries[unit["id"]] = entry_state
+            else:
+                entries.pop(unit["id"], None)
             continue
 
         entry_state = entries.get(unit["id"], {
@@ -472,6 +641,18 @@ def units_by_id(units):
 
 def state_unit_from_entry(entry_id, entry_state, configured):
     configured_unit = configured.get(entry_id, {})
+    process = entry_state.get("process", configured_unit.get("process"))
+    if process is not None:
+        if not isinstance(process, str) or not VALID_PROCESS_RE.match(process):
+            raise LoadshedError(f"invalid process name: {process!r}")
+        return {
+            "id": entry_id,
+            "label": configured_unit.get("label", entry_id),
+            "process": process,
+            "optional": configured_unit.get("optional", False),
+            "enabled": configured_unit.get("enabled", True),
+        }
+
     service = entry_state.get("service", configured_unit.get("service"))
     service = validate_unit_name(service, ".service")
     timer = entry_state.get("timer", configured_unit.get("timer"))
@@ -512,6 +693,19 @@ def resume_units(units, entry_ids=None):
             continue
 
         keep_state = dict(entry_state)
+        if keep_state.get("process_stopped"):
+            process = unit.get("process")
+            if process:
+                kept_processes = {}
+                for pid, proc in (entry_state.get("processes") or {}).items():
+                    try:
+                        continue_process(int(pid), process, str(proc.get("start_time")))
+                    except OSError as exc:
+                        if exc.errno != errno.ESRCH:
+                            errors.append(f"{unit['label']}: process resume failed for {pid}: {exc}")
+                            kept_processes[pid] = proc
+                keep_state["processes"] = kept_processes
+                keep_state["process_stopped"] = bool(kept_processes)
 
         if entry_state.get("service_frozen"):
             try:
@@ -536,6 +730,8 @@ def resume_units(units, entry_ids=None):
 
         if keep_state.get("service_frozen") or keep_state.get("timer_stopped"):
             remaining[entry_id] = keep_state
+        elif keep_state.get("process_stopped"):
+            remaining[entry_id] = keep_state
 
     save_state({"entries": remaining})
     return errors
@@ -555,7 +751,8 @@ def reconcile_config_state(old_units, new_units):
             continue
 
         if (
-            entry_state.get("service") != new_unit["service"] or
+            entry_state.get("service") != new_unit.get("service") or
+            entry_state.get("process") != new_unit.get("process") or
             entry_state.get("timer") != new_unit.get("timer")
         ):
             stale_ids.append(entry_id)
@@ -615,6 +812,9 @@ def status_payload(units, action, errors=None):
 
 
 def status_entry(unit, managed_state):
+    if unit.get("process"):
+        return process_status_entry(unit, managed_state)
+
     service_status = show_unit(unit["service"], include_freezer=True, extra_properties=["ControlGroup"])
     timer_status = show_unit(unit["timer"]) if unit.get("timer") else {}
     managed_state = managed_state or {}
@@ -653,6 +853,35 @@ def status_entry(unit, managed_state):
         "freeze_method": managed_state.get("freeze_method"),
         "external_frozen": service_frozen and not managed_state.get("service_frozen"),
         "error": error,
+    }
+
+
+def process_status_entry(unit, managed_state):
+    managed_state = managed_state or {}
+    processes = find_processes(unit["process"])
+    managed_processes = managed_state.get("processes") or {}
+    stopped_processes = {
+        pid: proc
+        for pid, proc in managed_processes.items()
+        if process_is_same(int(pid), unit["process"], str(proc.get("start_time")))
+    }
+    process_active = bool(processes)
+    process_stopped = bool(stopped_processes)
+
+    return {
+        "id": unit["id"],
+        "label": unit["label"],
+        "process": unit["process"],
+        "optional": unit.get("optional", False),
+        "process_active": process_active,
+        "process_count": len(processes),
+        "process_stopped": process_stopped,
+        "service_active": process_active,
+        "service_frozen": process_stopped,
+        "managed": bool(managed_state.get("process_stopped")) and process_stopped,
+        "paused": bool(managed_state.get("process_stopped")) and process_stopped,
+        "managed_process_stopped": bool(managed_state.get("process_stopped")) and process_stopped,
+        "error": None,
     }
 
 

@@ -124,5 +124,11 @@
     "service": "snapd.snap-repair.service",
     "timer": "snapd.snap-repair.timer",
     "optional": true
+  },
+  {
+    "id": "rsync",
+    "label": "rsync file sync",
+    "process": "rsync",
+    "optional": true
   }
 ]
