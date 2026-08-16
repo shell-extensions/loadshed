@@ -231,6 +231,14 @@ class LoadshedHelperTests(unittest.TestCase):
             "optional": True,
         }])
 
+    def test_legacy_process_migration_rejects_missing_canonical_executable(self):
+        with (
+            mock.patch.object(helper.os.path, "isfile", return_value=False),
+            mock.patch.object(helper.os, "stat", side_effect=FileNotFoundError),
+        ):
+            with self.assertRaisesRegex(helper.LoadshedError, "no executable|not found"):
+                helper.resolve_legacy_process("rsync")
+
     def test_load_units_writes_legacy_migration_once(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "units.json"
@@ -415,6 +423,16 @@ class LoadshedHelperTests(unittest.TestCase):
         self.assertEqual(continued, [(123, "/usr/bin/rsync", "42")])
         self.assertFalse(saved[-1]["paused"])
         self.assertEqual(saved[-1]["entries"], {})
+
+    def test_gate_release_accepts_inactive_unhealthy_gate(self):
+        response = {
+            "ok": True,
+            "active": False,
+            "healthy": False,
+            "error": "target disappeared",
+        }
+        with mock.patch.object(helper, "gate_request", return_value=response):
+            self.assertEqual(helper.gate_release(4), response)
 
     def test_status_does_not_claim_pause_when_gate_is_unhealthy(self):
         current_state = {

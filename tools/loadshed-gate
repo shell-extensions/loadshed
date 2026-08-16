@@ -320,10 +320,15 @@ class LoadshedGate:
 
     def release(self, request):
         generation = int(request.get("generation", self.generation))
-        if generation != self.generation:
+        if generation != self.generation and (self.active or self.queued):
             raise GateError(
                 f"generation mismatch: gate={self.generation}, request={generation}"
             )
+        # If the daemon restarted before configure() could persist a gate
+        # generation, there is no active mark or queued permission event to
+        # protect.  Accept the cleanup release and adopt the helper's
+        # generation so an interrupted pause can be resumed safely.
+        self.generation = generation
         self.active = False
         self._release_queued()
         self._write_state()
@@ -441,6 +446,8 @@ class LoadshedGate:
             if not data:
                 return
             request = json.loads(data.decode())
+            if not isinstance(request, dict):
+                raise GateError("gate request must be a JSON object")
             command = request.get("command")
             if command == "configure":
                 payload = self.configure(request)

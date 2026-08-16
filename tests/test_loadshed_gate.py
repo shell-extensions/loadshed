@@ -33,6 +33,19 @@ class FakeFanotify:
         pass
 
 
+class FakeConnection:
+    def __init__(self, payload):
+        self._payload = payload
+        self.responses = []
+
+    def recv(self, _size):
+        payload, self._payload = self._payload, b""
+        return payload
+
+    def sendall(self, payload):
+        self.responses.append(json.loads(payload))
+
+
 def protocol_request(socket_path, request):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(2)
@@ -311,6 +324,34 @@ class LoadshedGateUnitTests(unittest.TestCase):
                 released = gate.release({"generation": 8})
 
             self.assertFalse(released["active"])
+
+    def test_release_recovers_from_unconfigured_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = self.make_gate(Path(directory) / "gate-state.json")
+
+            with mock.patch.object(gate_module.os, "chown"):
+                released = gate.release({"generation": 9})
+
+            self.assertFalse(released["active"])
+            self.assertEqual(gate.generation, 9)
+
+    def test_release_rejects_generation_mismatch_while_active(self):
+        gate = self.make_gate(Path(tempfile.gettempdir()) / "unused-loadshed-gate-state.json")
+        gate.active = True
+        gate.generation = 3
+
+        with self.assertRaisesRegex(gate_module.GateError, "generation mismatch"):
+            gate.release({"generation": 4})
+
+    def test_non_object_socket_request_is_rejected_without_crashing(self):
+        gate = self.make_gate(Path(tempfile.gettempdir()) / "unused-loadshed-gate-state.json")
+        connection = FakeConnection(b"[]\n")
+
+        gate._handle_connection(connection)
+
+        self.assertEqual(len(connection.responses), 1)
+        self.assertFalse(connection.responses[0]["ok"])
+        self.assertIn("JSON object", connection.responses[0]["error"])
 
     def test_configure_failure_rolls_back_newly_added_marks(self):
         with tempfile.TemporaryDirectory() as directory:

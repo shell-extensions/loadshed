@@ -136,7 +136,7 @@ def resolve_legacy_process(process):
 
     canonical = LEGACY_CANONICAL_PATHS.get(process)
     if canonical:
-        return normalize_executable_path(canonical)
+        return normalize_executable_path(canonical, require_exists=True)
 
     raise LoadshedError(
         f"legacy process {process!r} has no executable in fixed system paths; "
@@ -428,8 +428,12 @@ def gate_release(generation):
     response = gate_request("release", generation=generation)
     if response.get("active"):
         raise LoadshedError("loadshed-gate did not confirm release")
-    if not response.get("healthy", True):
-        raise LoadshedError(response.get("error") or "loadshed-gate reported a release error")
+    # A gate may have become unhealthy while it was active (for example after
+    # a target disappeared).  release() still drops active protection and
+    # answers all queued permission events before returning active=false.  Do
+    # not leave the helper's pause intent permanently stuck just because the
+    # gate also reports the earlier fault; status will continue to expose that
+    # fault after the state has been cleaned up.
     return response
 
 
