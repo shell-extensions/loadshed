@@ -261,7 +261,7 @@ export class AppTargets {
             }
 
             const snapshot = state.paused[identity];
-            if (snapshot?.was_running && snapshot.command) {
+            if (snapshot?.was_running && snapshot?.stopped_by_loadshed !== false && snapshot.command) {
                 this._runner.startCommand(snapshot.command);
             }
             delete state.paused[identity];
@@ -291,12 +291,17 @@ export class AppTargets {
                     app_id: entry.app_id,
                     command: startCommandForEntry(entry),
                     was_running: running,
+                    stopped_by_loadshed: false,
                 };
                 changed = true;
             }
 
             if (running) {
-                await this._stop(entry);
+                const stopped = await this._stop(entry);
+                if (stopped && !state.paused[identity].stopped_by_loadshed) {
+                    state.paused[identity].stopped_by_loadshed = true;
+                    changed = true;
+                }
             }
         }
 
@@ -309,7 +314,7 @@ export class AppTargets {
         const state = this._readRuntimeState();
 
         Object.entries(state.paused).forEach(([, snapshot]) => {
-            if (snapshot?.was_running && snapshot.command) {
+            if (snapshot?.was_running && snapshot?.stopped_by_loadshed !== false && snapshot.command) {
                 this._runner.startCommand(snapshot.command);
             }
         });
@@ -319,6 +324,7 @@ export class AppTargets {
 
     async enforce() {
         const state = this._readRuntimeState();
+        let changed = false;
 
         for (const entry of this._activeEntries()) {
             const identity = appIdentity(entry);
@@ -326,8 +332,16 @@ export class AppTargets {
                 continue;
             }
             if (await this._isRunning(entry)) {
-                await this._stop(entry);
+                const stopped = await this._stop(entry);
+                if (stopped && !state.paused[identity].stopped_by_loadshed) {
+                    state.paused[identity].stopped_by_loadshed = true;
+                    changed = true;
+                }
             }
+        }
+
+        if (changed) {
+            this._writeRuntimeState(state);
         }
     }
 
@@ -350,6 +364,7 @@ export class AppTargets {
         return activeEntries.map(entry => {
             const identity = appIdentity(entry);
             const managed = Boolean(state.paused[identity]);
+            const snapshot = state.paused[identity];
             const running = Boolean(runningByIdentity.get(identity));
 
             return {
@@ -357,8 +372,10 @@ export class AppTargets {
                 label: entry.label || entry.id || entry.app_id,
                 service: entry.desktop_id || entry.app_id,
                 service_active: running,
-                paused: managed && !running,
+                paused: managed && snapshot?.was_running === true &&
+                    snapshot?.stopped_by_loadshed !== false && !running,
                 managed,
+                protected: false,
                 service_frozen: false,
             };
         });

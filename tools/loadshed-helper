@@ -64,9 +64,11 @@ def fail(message, action="error"):
         "action": action,
         "paused": False,
         "pause_intent": False,
+        "pause_state_known": False,
         "gate_healthy": False,
         "gate_active": False,
         "queued_exec_count": 0,
+        "protected_count": 0,
         "error": message,
         "entries": [],
         "errors": [message],
@@ -1052,12 +1054,17 @@ def status_payload(units, action, errors=None):
                 "service": entry_state.get("service", ""),
                 "timer": entry_state.get("timer"),
                 "managed": True,
-                "paused": True,
+                "paused": False,
+                "protected": False,
                 "error": str(exc),
             })
 
     paused_count = sum(1 for entry in entries if entry.get("paused"))
-    running_count = sum(1 for entry in entries if entry.get("service_active"))
+    running_count = sum(
+        1 for entry in entries
+        if entry.get("service_active") and not entry.get("paused") and not entry.get("external_frozen")
+    )
+    protected_count = sum(1 for entry in entries if entry.get("protected"))
     errors = list(errors or [])
     if not gate["healthy"]:
         errors.append(gate["error"] or "loadshed-gate is unhealthy")
@@ -1081,12 +1088,14 @@ def status_payload(units, action, errors=None):
         "action": action,
         "paused": strict_paused,
         "pause_intent": bool(state.get("paused")),
+        "pause_state_known": True,
         "gate_healthy": gate["healthy"],
         "gate_active": gate["active"],
         "queued_exec_count": gate["queued_exec_count"],
         "gate_error": gate["error"],
         "paused_count": paused_count,
         "running_count": running_count,
+        "protected_count": protected_count,
         "entries": entries,
         "errors": errors,
     }
@@ -1108,8 +1117,13 @@ def status_entry(unit, managed_state):
     service_active = service_status["ActiveState"] in ("active", "activating")
     cgroup_frozen = cgroup_frozen_from_status(service_status)
     service_frozen = service_status.get("FreezerState") == "frozen" or cgroup_frozen
-    timer_active = timer_status.get("ActiveState") == "active"
-    managed = bool(managed_state.get("service_frozen") or managed_state.get("timer_stopped"))
+    timer_active = timer_status.get("ActiveState") in ("active", "activating")
+    managed_service_frozen = bool(managed_state.get("service_frozen"))
+    managed_timer_stopped = bool(managed_state.get("timer_stopped"))
+    service_pause_effective = managed_service_frozen and service_frozen
+    timer_pause_effective = managed_timer_stopped and unit_loaded(timer_status) and not timer_active
+    paused = service_pause_effective or timer_pause_effective
+    managed = managed_service_frozen or managed_timer_stopped
 
     return {
         "id": unit["id"],
@@ -1128,11 +1142,12 @@ def status_entry(unit, managed_state):
         "timer_sub_state": timer_status.get("SubState"),
         "timer_active": timer_active,
         "managed": managed,
-        "paused": managed,
-        "managed_service_frozen": bool(managed_state.get("service_frozen")),
-        "managed_timer_stopped": bool(managed_state.get("timer_stopped")),
+        "paused": paused,
+        "protected": False,
+        "managed_service_frozen": managed_service_frozen,
+        "managed_timer_stopped": managed_timer_stopped,
         "freeze_method": managed_state.get("freeze_method"),
-        "external_frozen": service_frozen and not managed_state.get("service_frozen"),
+        "external_frozen": service_frozen and not managed_service_frozen,
         "error": error,
     }
 
@@ -1147,10 +1162,13 @@ def process_status_entry(unit, managed_state):
         for pid, proc in managed_processes.items()
         if process_is_same(int(pid), unit["executable"], str(proc.get("start_time")))
     }
-    process_active = bool(processes)
+    running_processes = [proc for proc in processes if proc.get("state") != "T"]
+    process_active = bool(running_processes)
     process_stopped = bool(stopped_processes)
-    intent_paused = bool(managed_state.get("pause_intent") and managed_state.get("gate_active"))
-    paused = intent_paused or process_stopped
+    protected = executable_exists and bool(
+        managed_state.get("pause_intent") and managed_state.get("gate_active")
+    )
+    paused = process_stopped
 
     return {
         "id": unit["id"],
@@ -1159,10 +1177,13 @@ def process_status_entry(unit, managed_state):
         "optional": unit.get("optional", False),
         "process_active": process_active,
         "process_count": len(processes),
+        "running_process_count": len(running_processes),
         "process_stopped": process_stopped,
         "service_active": process_active,
         "service_frozen": process_stopped,
-        "managed": paused,
+        "protected": protected,
+        "stopped_process_count": len(stopped_processes),
+        "managed": bool(managed_state.get("process_stopped")) or protected,
         "paused": paused,
         "managed_process_stopped": bool(managed_state.get("process_stopped")) and process_stopped,
         "error": None if executable_exists else f"executable not found: {unit['executable']}",

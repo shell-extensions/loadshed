@@ -121,6 +121,125 @@ class LoadshedHelperTests(unittest.TestCase):
         self.assertEqual(payload["entries"], [{"id": "alpha", "paused": True}])
         self.assertTrue(payload["paused"])
 
+    def test_status_counts_only_effective_service_freeze(self):
+        managed = state_entry("alpha")
+        running_status = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "FreezerState": "running",
+            "ControlGroup": "/system.slice/alpha.service",
+        }
+        frozen_status = {**running_status, "FreezerState": "frozen"}
+
+        with (
+            mock.patch.object(helper, "show_unit", return_value=running_status),
+            mock.patch.object(helper, "cgroup_frozen_from_status", return_value=False),
+        ):
+            entry = helper.status_entry(unit("alpha"), managed)
+
+        self.assertTrue(entry["managed"])
+        self.assertFalse(entry["paused"])
+        self.assertFalse(entry["external_frozen"])
+
+        with (
+            mock.patch.object(helper, "show_unit", return_value=frozen_status),
+            mock.patch.object(helper, "cgroup_frozen_from_status", return_value=False),
+        ):
+            entry = helper.status_entry(unit("alpha"), {})
+
+        self.assertFalse(entry["managed"])
+        self.assertFalse(entry["paused"])
+        self.assertTrue(entry["external_frozen"])
+
+        with (
+            mock.patch.object(helper, "show_unit", return_value=frozen_status),
+            mock.patch.object(helper, "cgroup_frozen_from_status", return_value=False),
+        ):
+            entry = helper.status_entry(unit("alpha"), managed)
+
+        self.assertTrue(entry["paused"])
+        self.assertFalse(entry["external_frozen"])
+
+    def test_status_counts_stopped_timer_as_paused_only_while_inactive(self):
+        managed = state_entry("alpha", timer="alpha.timer")
+        managed["service_frozen"] = False
+        managed["timer_stopped"] = True
+
+        def show_unit(name, include_freezer=False, extra_properties=None):
+            if name == "alpha.timer":
+                return {"LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead"}
+            return {"LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead", "FreezerState": "running"}
+
+        with (
+            mock.patch.object(helper, "show_unit", side_effect=show_unit),
+            mock.patch.object(helper, "cgroup_frozen_from_status", return_value=False),
+        ):
+            entry = helper.status_entry(unit("alpha", timer="alpha.timer"), managed)
+
+        self.assertTrue(entry["paused"])
+
+        def active_timer(name, include_freezer=False, extra_properties=None):
+            status = show_unit(name, include_freezer, extra_properties)
+            if name == "alpha.timer":
+                status["ActiveState"] = "active"
+            return status
+
+        with (
+            mock.patch.object(helper, "show_unit", side_effect=active_timer),
+            mock.patch.object(helper, "cgroup_frozen_from_status", return_value=False),
+        ):
+            entry = helper.status_entry(unit("alpha", timer="alpha.timer"), managed)
+
+        self.assertFalse(entry["paused"])
+
+    def test_executable_protection_is_not_reported_as_currently_paused(self):
+        managed = {
+            "executable": "/usr/bin/rsync",
+            "process_stopped": False,
+            "processes": {},
+            "pause_intent": True,
+            "gate_active": True,
+        }
+
+        with (
+            mock.patch.object(helper.os.path, "exists", return_value=True),
+            mock.patch.object(helper, "find_processes", return_value=[]),
+        ):
+            entry = helper.process_status_entry(process("rsync"), managed)
+
+        self.assertFalse(entry["paused"])
+        self.assertTrue(entry["protected"])
+        self.assertEqual(entry["stopped_process_count"], 0)
+
+    def test_status_payload_counts_only_effective_pauses(self):
+        current_state = {
+            "paused": True,
+            "generation": 1,
+            "entries": {"alpha": state_entry("alpha"), "beta": state_entry("beta")},
+        }
+        entries = [
+            {"id": "alpha", "paused": False, "service_active": True, "external_frozen": True},
+            {"id": "beta", "paused": True, "service_active": False, "protected": False},
+        ]
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "gate_status", return_value={
+                "healthy": True,
+                "active": True,
+                "generation": 1,
+                "queued_exec_count": 0,
+                "error": None,
+            }),
+            mock.patch.object(helper, "status_entry", side_effect=entries),
+        ):
+            payload = helper.status_payload([unit("alpha")], "status")
+
+        self.assertEqual(payload["paused_count"], 1)
+        self.assertEqual(payload["running_count"], 0)
+        self.assertTrue(payload["pause_state_known"])
+
     def test_catalog_does_not_mark_unmanaged_executable_as_managed(self):
         current_state = {"paused": True, "generation": 1, "entries": {}}
         with (

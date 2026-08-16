@@ -117,6 +117,9 @@ reset([signalTarget]);
 runner = new FakeRunner([]);
 manager = new AppTargets(managerSettings, runner);
 await manager.applyPause();
+status = await manager.status();
+assertEqual(status[0].managed, true, 'non-running app still keeps its pause intent');
+assertEqual(status[0].paused, false, 'non-running app is not counted as currently paused');
 manager.applyResume();
 assertArrayEqual(runner.started, [], 'resume does not start an app that was not running before pause');
 

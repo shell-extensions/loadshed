@@ -125,6 +125,7 @@ bundle_source="${pack_dir}/source"
   "${script_dir}/appTargets.js" \
   "${script_dir}/gsettingsTargets.js" \
   "${script_dir}/fileTargets.js" \
+  "${script_dir}/statusSummary.js" \
   "${script_dir}/stylesheet.css" \
   "${script_dir}/README.md" \
   "${script_dir}/README.de.md" \
@@ -152,6 +153,7 @@ echo "Packing extension bundle"
   --extra-source=appTargets.js \
   --extra-source=gsettingsTargets.js \
   --extra-source=fileTargets.js \
+  --extra-source=statusSummary.js \
   --extra-source=systemd \
   --extra-source=po \
   --extra-source=tools \

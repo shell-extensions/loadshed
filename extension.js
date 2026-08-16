@@ -29,6 +29,7 @@ import { Extension, gettext as _, ngettext } from 'resource:///org/gnome/shell/e
 import { AppTargets } from './appTargets.js';
 import { GSettingsTargets } from './gsettingsTargets.js';
 import { FileTargets } from './fileTargets.js';
+import { summarizeStatus } from './statusSummary.js';
 
 const HELPER_INSTALL_PATH = '/usr/local/bin/loadshed-helper';
 const DEFAULT_REFRESH_INTERVAL = 10;
@@ -265,7 +266,11 @@ class LoadshedToggle extends QuickSettings.QuickMenuToggle {
         }
 
         const action = this.checked ? 'enforce' : 'status';
-        const preAction = this.checked ? this._manager.enforceTargets() : Promise.resolve();
+        // The helper is authoritative for the persistent pause intent.  Do
+        // not change target state before its response tells us whether the
+        // pause is still active; _applyStatus() reconciles targets after that
+        // response is known.
+        const preAction = Promise.resolve();
 
         this._busy = true;
         this.subtitle = _('Refreshing');
@@ -283,14 +288,10 @@ class LoadshedToggle extends QuickSettings.QuickMenuToggle {
             return;
         }
 
-        let preAction;
-        if (action === 'pause') {
-            preAction = this._manager.applyPause();
-        } else if (action === 'resume') {
-            preAction = Promise.resolve(this._manager.applyResume());
-        } else {
-            preAction = Promise.resolve();
-        }
+        // Let the root helper perform the transition first.  _applyStatus()
+        // then applies or releases the user-session targets according to the
+        // confirmed pause intent, preserving the gate during resume.
+        const preAction = Promise.resolve();
 
         this._busy = true;
         this.subtitle = action === 'pause' ? _('Pausing') : _('Resuming');
@@ -333,36 +334,52 @@ class LoadshedToggle extends QuickSettings.QuickMenuToggle {
     }
 
     async _applyStatus(status) {
-        const helperEntries = Array.isArray(status.entries) ? status.entries : [];
-        const helperPaused = Boolean(status.paused);
-        let targetEntries = await this._manager.targetsStatus();
-        const targetManaged = targetEntries.some(entry => entry.managed);
-        if (helperPaused || targetManaged) {
-            await this._manager.enforceTargets();
-            targetEntries = await this._manager.targetsStatus();
+        const helperStatus = status && typeof status === 'object' ? status : {};
+        const helperEntries = Array.isArray(helperStatus.entries) ? helperStatus.entries : [];
+
+        // A normal helper response explicitly tells us whether the root
+        // pause state is known.  Keep the target snapshots while the root
+        // intent is active (this also repairs targets after an extension
+        // reload), and clear stale snapshots only after a known resume.
+        if (helperStatus.pause_state_known === true) {
+            if (helperStatus.pause_intent === true) {
+                await this._manager.applyPause();
+            } else {
+                this._manager.applyResume();
+            }
         }
+
+        const targetEntries = await this._manager.targetsStatus();
         const entries = helperEntries.concat(targetEntries);
+        const summary = summarizeStatus(helperStatus, targetEntries);
 
-        const pausedCount = Number(status.paused_count || 0) + targetEntries.filter(entry => entry.managed).length;
-        const runningCount = Number(status.running_count || 0) + targetEntries.filter(entry => !entry.paused).length;
-        const paused = helperPaused || targetEntries.some(entry => entry.managed);
-
-        this.checked = paused;
-        this._indicator.visible = paused;
+        this.checked = summary.strictPaused;
+        this._indicator.visible = summary.strictPaused;
 
         if (entries.length === 0) {
             this.subtitle = _('No services configured');
-        } else if (pausedCount > 0) {
-            this.subtitle = formatCountLabel(ngettext('1 paused', '%d paused', pausedCount), pausedCount);
-        } else if (runningCount > 0) {
-            this.subtitle = formatCountLabel(ngettext('1 running', '%d running', runningCount), runningCount);
+        } else if (summary.pausedCount > 0) {
+            this.subtitle = formatCountLabel(
+                ngettext('1 target paused', '%d targets paused', summary.pausedCount),
+                summary.pausedCount
+            );
+        } else if (summary.runningCount > 0) {
+            this.subtitle = formatCountLabel(
+                ngettext('1 target running', '%d targets running', summary.runningCount),
+                summary.runningCount
+            );
+        } else if (summary.protectedCount > 0) {
+            this.subtitle = formatCountLabel(
+                ngettext('1 target protected', '%d targets protected', summary.protectedCount),
+                summary.protectedCount
+            );
         } else {
             this.subtitle = _('Nothing running');
         }
 
-        if (Array.isArray(status.errors) && status.errors.length > 0) {
+        if (Array.isArray(helperStatus.errors) && helperStatus.errors.length > 0) {
             this.subtitle = _('Partial error');
-            Main.notify(_('Loadshed'), status.errors.join('\n'));
+            Main.notify(_('Loadshed'), helperStatus.errors.join('\n'));
         }
 
         this._rebuildEntryItems(entries);
@@ -431,15 +448,16 @@ class LoadshedToggle extends QuickSettings.QuickMenuToggle {
     }
 
     _entryVisible(entry) {
-        return Boolean(entry.error) || (
-            entry.service_active &&
-            !entry.paused &&
-            !entry.service_frozen
+        return Boolean(
+            entry.error ||
+            entry.external_frozen ||
+            entry.protected ||
+            (entry.service_active && !entry.paused)
         );
     }
 
     _entryPaused(entry) {
-        return Boolean(entry.paused || entry.managed || entry.service_frozen);
+        return Boolean(entry.paused);
     }
 
     _hiddenEntriesLabel(entries) {
@@ -475,8 +493,14 @@ class LoadshedToggle extends QuickSettings.QuickMenuToggle {
         if (entry.error) {
             return 'dialog-warning-symbolic';
         }
-        if (entry.paused || entry.service_frozen) {
+        if (entry.paused) {
             return 'media-playback-pause-symbolic';
+        }
+        if (entry.protected) {
+            return 'changes-prevent-symbolic';
+        }
+        if (entry.external_frozen) {
+            return 'dialog-warning-symbolic';
         }
         if (entry.service_active) {
             return 'media-playback-start-symbolic';

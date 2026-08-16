@@ -95,6 +95,27 @@ msgid_plural "%d running"
 msgstr[0] "1 läuft"
 msgstr[1] "%d laufen"
 
+#: extension.js
+#, javascript-format
+msgid "1 target paused"
+msgid_plural "%d targets paused"
+msgstr[0] "1 Ziel pausiert"
+msgstr[1] "%d Ziele pausiert"
+
+#: extension.js
+#, javascript-format
+msgid "1 target running"
+msgid_plural "%d targets running"
+msgstr[0] "1 Ziel läuft"
+msgstr[1] "%d Ziele laufen"
+
+#: extension.js
+#, javascript-format
+msgid "1 target protected"
+msgid_plural "%d targets protected"
+msgstr[0] "1 Ziel geschützt"
+msgstr[1] "%d Ziele geschützt"
+
 #: extension.js:320
 msgid "Nothing running"
 msgstr "Nichts läuft"
