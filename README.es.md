@@ -131,6 +131,52 @@ aplicaciones Flatpak con `flatpak run <app_id>` y las Snap con `snap run <app_id
 de inicio solo cuando una aplicación necesite otro lanzador o flags adicionales, por ejemplo una
 opción de bandeja o segundo plano.
 
+## Regulador de temperatura
+
+Loadshed puede mantener opcionalmente la temperatura de la CPU por debajo de
+un objetivo calibrado limitando únicamente los procesos `ad_hoc` indicados de
+forma explícita. El firmware sigue controlando el ventilador: Loadshed nunca
+escribe valores de ventilador, PWM ni ACPI de ThinkPad. El regulador se instala
+desactivado y debe calibrarse antes de usarlo.
+
+La configuración se guarda en `/etc/loadshed/thermal.json` y contiene tres
+listas de procesos:
+
+- `essential`: nombres protegidos que nunca se modifican automáticamente.
+- `important`: procesos importantes para el momento; el gobernador térmico no
+  los modifica.
+- `ad_hoc`: procesos explícitos sin privilegios que pueden limitarse o pausarse.
+
+El catálogo inicial propone candidatos conservadores como `rsync`, `rclone`,
+`du`, `updatedb`, `ffmpeg`, ImageMagick y herramientas de compresión. Todos
+están desactivados hasta que se habiliten conscientemente.
+
+```bash
+sudo /usr/local/bin/loadshed-helper thermal-status
+sudo /usr/local/bin/loadshed-helper thermal-config-get
+sudo /usr/local/bin/loadshed-helper thermal-config-set < thermal.json
+sudo /usr/local/bin/loadshed-helper thermal-calibrate
+```
+
+La calibración inicia una carga interna limitada, aborta a 85 °C, registra la
+temperatura y los cambios del ventilador en
+`/run/loadshed/thermal-calibration.jsonl` y escribe un objetivo conservador.
+El regulador permanece desactivado hasta activarlo explícitamente:
+
+```bash
+sudo /usr/local/bin/loadshed-helper thermal-enable
+sudo systemctl enable --now loadshed-thermal.service
+```
+
+Para desactivarlo y limpiar sus cgroups:
+
+```bash
+sudo systemctl disable --now loadshed-thermal.service
+```
+
+La pausa manual de Loadshed es independiente y el regulador térmico nunca la
+reanuda.
+
 ## Recuperación manual
 
 ```bash

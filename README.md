@@ -136,6 +136,53 @@ resumes Flatpak apps with `flatpak run <app_id>` and Snap apps with
 `snap run <app_id>`. Set a start command only when an app needs a different
 launcher or extra flags, for example a tray/background option.
 
+## Temperature Governor
+
+Loadshed can optionally keep CPU temperature below a calibrated target by
+limiting only explicitly listed `ad_hoc` processes. The firmware remains in
+charge of the fan: Loadshed never writes fan, PWM, or ThinkPad ACPI fan
+controls. The governor is installed disabled and must be calibrated before it
+can be enabled.
+
+The configuration is stored in `/etc/loadshed/thermal.json`. It has three
+process lists:
+
+- `essential`: protected names; never automatically changed.
+- `important`: protected documentation for work that must remain responsive;
+  the thermal governor never targets it.
+- `ad_hoc`: explicit non-root process names that may be cgroup-throttled or frozen.
+
+The default catalog contains safe candidates such as `rsync`, `rclone`, `du`,
+`updatedb`, `ffmpeg`, ImageMagick, and compression tools, but every candidate
+is disabled until explicitly enabled. Inspect and update the policy through
+the privileged helper:
+
+```bash
+sudo /usr/local/bin/loadshed-helper thermal-status
+sudo /usr/local/bin/loadshed-helper thermal-config-get
+sudo /usr/local/bin/loadshed-helper thermal-config-set < thermal.json
+sudo /usr/local/bin/loadshed-helper thermal-calibrate
+```
+
+Calibration starts a bounded internal CPU workload, aborts at 85 °C, records
+temperature and fan transitions in `/run/loadshed/thermal-calibration.jsonl`,
+and writes a conservative target while leaving the governor disabled. Review
+the result, then enable it deliberately:
+
+```bash
+sudo /usr/local/bin/loadshed-helper thermal-enable
+sudo systemctl enable --now loadshed-thermal.service
+```
+
+Disable and clean up thermal-owned cgroups with:
+
+```bash
+sudo systemctl disable --now loadshed-thermal.service
+```
+
+The manual Loadshed pause state is independent and is never resumed by the
+thermal governor.
+
 ## Manual Recovery
 
 ```bash

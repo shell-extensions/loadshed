@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "enabled": false,
+  "interval_seconds": 1.0,
+  "target_c": null,
+  "fan_on_c": null,
+  "fan_off_c": null,
+  "critical_c": 90.0,
+  "throttle_delta_c": 1.0,
+  "pause_delta_c": 4.0,
+  "resume_delta_c": 3.0,
+  "dwell_seconds": 5.0,
+  "cooldown_seconds": 15.0,
+  "throttle_percent": 25.0,
+  "essential": [],
+  "important": [],
+  "ad_hoc": [
+    {
+      "id": "rsync",
+      "process": "rsync",
+      "enabled": false,
+      "throttle_percent": 25.0
+    },
+    {
+      "id": "rclone",
+      "process": "rclone",
+      "enabled": false,
+      "throttle_percent": 25.0
+    },
+    {
+      "id": "du",
+      "process": "du",
+      "enabled": false,
+      "throttle_percent": 25.0
+    },
+    {
+      "id": "updatedb",
+      "process": "updatedb",
+      "enabled": false,
+      "throttle_percent": 25.0
+    },
+    {
+      "id": "plocate",
+      "process": "plocate",
+      "enabled": false,
+      "throttle_percent": 25.0
+    },
+    {
+      "id": "ffmpeg",
+      "process": "ffmpeg",
+      "enabled": false,
+      "throttle_percent": 25.0
+    },
+    {
+      "id": "magick",
+      "process": "magick",
+      "enabled": false,
+      "throttle_percent": 25.0
+    },
+    {
+      "id": "convert",
+      "process": "convert",
+      "enabled": false,
+      "throttle_percent": 25.0
+    },
+    {
+      "id": "tar",
+      "process": "tar",
+      "enabled": false,
+      "throttle_percent": 25.0
+    },
+    {
+      "id": "zstd",
+      "process": "zstd",
+      "enabled": false,
+      "throttle_percent": 25.0
+    }
+  ]
+}

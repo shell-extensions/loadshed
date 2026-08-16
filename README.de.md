@@ -131,6 +131,52 @@ Wenn kein Startbefehl konfiguriert ist, setzt Loadshed Flatpak-Apps mit `flatpak
 Snap-Apps mit `snap run <app_id>` fort. Setze einen Startbefehl nur, wenn eine App einen anderen
 Launcher oder zusätzliche Flags benötigt, zum Beispiel eine Tray-/Hintergrundoption.
 
+## Temperaturregler
+
+Loadshed kann die CPU-Temperatur optional unter einem kalibrierten Zielwert
+halten, indem ausschließlich ausdrücklich eingetragene `ad_hoc`-Prozesse
+begrenzt werden. Die Firmware bleibt für den Lüfter zuständig: Loadshed
+schreibt keine Lüfter-, PWM- oder ThinkPad-ACPI-Lüfterwerte. Der Regler wird
+deaktiviert installiert und muss vor der Nutzung kalibriert werden.
+
+Die Konfiguration liegt in `/etc/loadshed/thermal.json` und enthält drei
+Prozesslisten:
+
+- `essential`: geschützte Namen, niemals automatisch verändert.
+- `important`: aktuell wichtige Prozesse; der Thermal-Governor greift auf sie
+  nicht zu.
+- `ad_hoc`: ausdrücklich erlaubte Nicht-Root-Prozesse, die gedrosselt oder pausiert werden dürfen.
+
+Der Standardkatalog enthält vorsichtige Kandidaten wie `rsync`, `rclone`, `du`,
+`updatedb`, `ffmpeg`, ImageMagick und Kompressionsprogramme. Alle Einträge
+sind zunächst deaktiviert und müssen bewusst aktiviert werden.
+
+```bash
+sudo /usr/local/bin/loadshed-helper thermal-status
+sudo /usr/local/bin/loadshed-helper thermal-config-get
+sudo /usr/local/bin/loadshed-helper thermal-config-set < thermal.json
+sudo /usr/local/bin/loadshed-helper thermal-calibrate
+```
+
+Die Kalibrierung startet eine begrenzte interne CPU-Testlast, bricht bei 85 °C
+ab, protokolliert Temperatur und Lüfterwechsel nach
+`/run/loadshed/thermal-calibration.jsonl` und schreibt einen konservativen
+Zielwert. Der Regler bleibt danach deaktiviert, bis er bewusst aktiviert wird:
+
+```bash
+sudo /usr/local/bin/loadshed-helper thermal-enable
+sudo systemctl enable --now loadshed-thermal.service
+```
+
+Zum Abschalten und Aufräumen der eigenen cgroups:
+
+```bash
+sudo systemctl disable --now loadshed-thermal.service
+```
+
+Die manuelle Loadshed-Pause bleibt unabhängig und wird vom Temperaturregler
+nicht fortgesetzt.
+
 ## Manuelle Wiederherstellung
 
 ```bash

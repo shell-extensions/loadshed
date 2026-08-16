@@ -27,16 +27,33 @@ import stat
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 CONFIG_DIR = "/etc/loadshed"
 CONFIG_PATH = f"{CONFIG_DIR}/units.json"
 STATE_DIR = "/run/loadshed"
 STATE_PATH = f"{STATE_DIR}/state.json"
 CGROUP_ROOT = "/sys/fs/cgroup"
+THERMAL_CONFIG_PATH = f"{CONFIG_DIR}/thermal.json"
+THERMAL_INSTALL_PATH = "/usr/local/libexec/loadshed-thermal"
+THERMAL_MODULE_DIR = "/usr/local/libexec/loadshed"
 
 VALID_ID_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 VALID_UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:\\-]+\.(service|timer)$")
 VALID_PROCESS_RE = re.compile(r"^[A-Za-z0-9_.@:+-]+$")
+
+
+def load_thermal_policy_module():
+    candidates = [Path(__file__).resolve().parent, Path(THERMAL_MODULE_DIR)]
+    for candidate in candidates:
+        if str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+        try:
+            import thermal_policy
+            return thermal_policy
+        except ImportError:
+            continue
+    raise LoadshedError("thermal policy module is not installed")
 
 
 class LoadshedError(Exception):
@@ -217,6 +234,41 @@ def config_payload(action, units):
         "entries": serialize_units(units),
         "errors": [],
     }
+
+
+def thermal_config_payload(action, config):
+    policy = load_thermal_policy_module()
+    return {
+        "ok": True,
+        "action": action,
+        "config": policy.serialize_config(config),
+        "errors": [],
+    }
+
+
+def run_thermal_command(action):
+    if not os.path.isfile(THERMAL_INSTALL_PATH) or not os.access(THERMAL_INSTALL_PATH, os.X_OK):
+        raise LoadshedError("thermal daemon is not installed")
+    result = subprocess.run(
+        [THERMAL_INSTALL_PATH, action],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    payload = None
+    if result.stdout.strip():
+        try:
+            payload = json.loads(result.stdout.strip())
+        except json.JSONDecodeError:
+            payload = None
+    if result.returncode != 0:
+        detail = payload.get("error") if isinstance(payload, dict) else None
+        detail = detail or result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise LoadshedError(detail)
+    if not isinstance(payload, dict):
+        raise LoadshedError("thermal daemon returned invalid JSON")
+    return payload
 
 
 def unit_enabled(unit):
@@ -887,9 +939,17 @@ def process_status_entry(unit, managed_state):
 
 def main():
     action = sys.argv[1] if len(sys.argv) == 2 else None
-    valid_actions = {"status", "pause", "resume", "toggle", "enforce", "config-get", "config-set", "catalog-status"}
+    valid_actions = {
+        "status", "pause", "resume", "toggle", "enforce", "config-get", "config-set",
+        "catalog-status", "thermal-status", "thermal-calibrate", "thermal-config-get",
+        "thermal-config-set", "thermal-enable", "thermal-disable",
+    }
     if action not in valid_actions:
-        return fail("usage: loadshed-helper status|pause|resume|toggle|enforce|config-get|config-set|catalog-status")
+        return fail(
+            "usage: loadshed-helper status|pause|resume|toggle|enforce|config-get|config-set|"
+            "catalog-status|thermal-status|thermal-calibrate|thermal-config-get|thermal-config-set"
+            "|thermal-enable|thermal-disable"
+        )
 
     try:
         require_root()
@@ -903,6 +963,39 @@ def main():
             raw_catalog = sys.stdin.read()
             units = validate_units(json.loads(raw_catalog)) if raw_catalog.strip() else load_units()
             json_print(catalog_status_payload(units))
+            return 0
+
+        if action == "thermal-config-get":
+            policy = load_thermal_policy_module()
+            json_print(thermal_config_payload(action, policy.load_config(THERMAL_CONFIG_PATH)))
+            return 0
+
+        if action == "thermal-config-set":
+            policy = load_thermal_policy_module()
+            raw_config = sys.stdin.read()
+            if not raw_config.strip():
+                raise LoadshedError("empty thermal configuration")
+            config = policy.validate_config(json.loads(raw_config))
+            policy.save_config(config, THERMAL_CONFIG_PATH)
+            json_print(thermal_config_payload(action, config))
+            return 0
+
+        if action in {"thermal-enable", "thermal-disable"}:
+            policy = load_thermal_policy_module()
+            config = policy.load_config(THERMAL_CONFIG_PATH)
+            if action == "thermal-enable" and config["target_c"] is None:
+                raise LoadshedError("thermal calibration is required before enabling")
+            config["enabled"] = action == "thermal-enable"
+            config = policy.save_config(config, THERMAL_CONFIG_PATH)
+            json_print(thermal_config_payload(action, config))
+            return 0
+
+        if action == "thermal-status":
+            json_print(run_thermal_command("status"))
+            return 0
+
+        if action == "thermal-calibrate":
+            json_print(run_thermal_command("calibrate"))
             return 0
 
         if action == "config-set":

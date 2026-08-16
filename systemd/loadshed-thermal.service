@@ -1,0 +1,27 @@
+[Unit]
+Description=Loadshed temperature-driven process governor
+ConditionPathExists=/etc/loadshed/thermal.json
+After=local-fs.target systemd-udev-settle.service
+
+[Service]
+Type=notify
+ExecStart=/usr/local/libexec/loadshed-thermal daemon
+ExecStopPost=/usr/local/libexec/loadshed-thermal cleanup
+Restart=on-failure
+RestartSec=2s
+WatchdogSec=30s
+NotifyAccess=main
+TimeoutStopSec=10s
+User=root
+Delegate=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=no
+ReadWritePaths=/etc/loadshed /run/loadshed /sys/fs/cgroup
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

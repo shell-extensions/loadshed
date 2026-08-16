@@ -19,17 +19,25 @@
 
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 EXT_UUID="loadshed@yurij.de"
 LEGACY_EXT_UUID="service-pauser@yurij.de"
 HELPER_NAME="loadshed-helper"
 HELPER_INSTALL_PATH="/usr/local/bin/${HELPER_NAME}"
+THERMAL_INSTALL_PATH="/usr/local/libexec/loadshed-thermal"
+THERMAL_MODULE_DIR="/usr/local/libexec/loadshed"
+THERMAL_DAEMON_SRC="${script_dir}/tools/thermal_daemon.py"
+THERMAL_POLICY_SRC="${script_dir}/tools/thermal_policy.py"
+THERMAL_CONFIG_PATH="/etc/loadshed/thermal.json"
+THERMAL_DEFAULT_CONFIG_SRC="${script_dir}/tools/thermal.default.json"
+THERMAL_UNIT_SRC="${script_dir}/systemd/loadshed-thermal.service"
+THERMAL_UNIT_INSTALL_PATH="/etc/systemd/system/loadshed-thermal.service"
 CONFIG_DIR="/etc/loadshed"
 CONFIG_PATH="${CONFIG_DIR}/units.json"
 SUDOERS_FILE="/etc/sudoers.d/loadshed"
 LEGACY_CONFIG_PATH="/etc/service-pauser/units.json"
 LEGACY_SUDOERS_FILE="/etc/sudoers.d/service-pauser"
-
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 helper_src="${script_dir}/tools/${HELPER_NAME}"
 units_src="${script_dir}/tools/units.default.json"
@@ -44,6 +52,13 @@ if [[ ! -f "${units_src}" ]]; then
   echo "Default units file not found: ${units_src}" >&2
   exit 1
 fi
+
+for required_file in "${THERMAL_DAEMON_SRC}" "${THERMAL_POLICY_SRC}" "${THERMAL_DEFAULT_CONFIG_SRC}" "${THERMAL_UNIT_SRC}"; do
+  if [[ ! -f "${required_file}" ]]; then
+    echo "Required thermal file not found: ${required_file}" >&2
+    exit 1
+  fi
+done
 
 if ! command -v sudo >/dev/null 2>&1; then
   echo "sudo not found. Install sudo or run the privileged setup manually." >&2
@@ -111,6 +126,7 @@ bundle_source="${pack_dir}/source"
 "${as_user[@]}" install -m 0755 "${script_dir}/install.sh" "${bundle_source}/install.sh"
 "${as_user[@]}" install -m 0755 "${helper_src}" "${bundle_source}/tools/${HELPER_NAME}"
 "${as_user[@]}" install -m 0644 "${units_src}" "${bundle_source}/tools/units.default.json"
+"${as_user[@]}" install -m 0644 "${THERMAL_DEFAULT_CONFIG_SRC}" "${bundle_source}/tools/thermal.default.json"
 "${as_user[@]}" install -m 0644 "${schema_src}" "${bundle_source}/schemas/"
 for translation_src in "${script_dir}"/po/*.po; do
   [[ -e "${translation_src}" ]] || continue
@@ -138,6 +154,14 @@ echo "Installing extension bundle"
 echo "Installing helper to ${HELPER_INSTALL_PATH}"
 sudo install -o root -g root -m 0755 "${helper_src}" "${HELPER_INSTALL_PATH}"
 
+echo "Installing thermal daemon to ${THERMAL_INSTALL_PATH}"
+sudo install -d -o root -g root -m 0755 "${THERMAL_MODULE_DIR}"
+sudo install -o root -g root -m 0755 "${script_dir}/tools/loadshed-thermal" "${THERMAL_INSTALL_PATH}"
+sudo install -o root -g root -m 0644 "${THERMAL_DAEMON_SRC}" "${THERMAL_MODULE_DIR}/thermal_daemon.py"
+sudo install -o root -g root -m 0644 "${THERMAL_POLICY_SRC}" "${THERMAL_MODULE_DIR}/thermal_policy.py"
+sudo install -o root -g root -m 0644 "${THERMAL_UNIT_SRC}" "${THERMAL_UNIT_INSTALL_PATH}"
+sudo systemctl daemon-reload
+
 echo "Installing configuration directory ${CONFIG_DIR}"
 sudo install -d -o root -g root -m 0755 "${CONFIG_DIR}"
 
@@ -153,8 +177,17 @@ else
   sudo install -o root -g root -m 0644 "${units_src}" "${CONFIG_PATH}"
 fi
 
+if sudo test -e "${THERMAL_CONFIG_PATH}"; then
+  echo "Keeping existing ${THERMAL_CONFIG_PATH}"
+  sudo chown root:root "${THERMAL_CONFIG_PATH}"
+  sudo chmod 0644 "${THERMAL_CONFIG_PATH}"
+else
+  echo "Installing disabled thermal configuration to ${THERMAL_CONFIG_PATH}"
+  sudo install -o root -g root -m 0644 "${THERMAL_DEFAULT_CONFIG_SRC}" "${THERMAL_CONFIG_PATH}"
+fi
+
 sudo tee "${SUDOERS_FILE}" >/dev/null <<EOF
-Cmnd_Alias LOADSHED_HELPER = ${HELPER_INSTALL_PATH} status, ${HELPER_INSTALL_PATH} pause, ${HELPER_INSTALL_PATH} resume, ${HELPER_INSTALL_PATH} toggle, ${HELPER_INSTALL_PATH} enforce, ${HELPER_INSTALL_PATH} config-get, ${HELPER_INSTALL_PATH} config-set, ${HELPER_INSTALL_PATH} catalog-status
+Cmnd_Alias LOADSHED_HELPER = ${HELPER_INSTALL_PATH} status, ${HELPER_INSTALL_PATH} pause, ${HELPER_INSTALL_PATH} resume, ${HELPER_INSTALL_PATH} toggle, ${HELPER_INSTALL_PATH} enforce, ${HELPER_INSTALL_PATH} config-get, ${HELPER_INSTALL_PATH} config-set, ${HELPER_INSTALL_PATH} catalog-status, ${HELPER_INSTALL_PATH} thermal-status, ${HELPER_INSTALL_PATH} thermal-calibrate, ${HELPER_INSTALL_PATH} thermal-config-get, ${HELPER_INSTALL_PATH} thermal-config-set, ${HELPER_INSTALL_PATH} thermal-enable, ${HELPER_INSTALL_PATH} thermal-disable
 ${target_user} ALL=(root) NOPASSWD: LOADSHED_HELPER
 EOF
 
@@ -163,6 +196,7 @@ sudo visudo -c -f "${SUDOERS_FILE}" >/dev/null
 
 echo "Done."
 echo "Enable after GNOME Shell reload/login with: gnome-extensions enable ${EXT_UUID}"
+echo "Thermal governor is installed but disabled until calibration and review: sudo systemctl enable --now loadshed-thermal.service"
 if sudo test -e "${LEGACY_SUDOERS_FILE}"; then
   echo "Legacy sudoers file detected. Remove after verifying the new helper works: sudo rm -f ${LEGACY_SUDOERS_FILE}"
 fi

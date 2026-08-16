@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Executable entry point for the Loadshed thermal daemon."""
+
+from pathlib import Path
+import sys
+
+
+candidate_dirs = [
+    Path(__file__).resolve().parent,
+    Path(__file__).resolve().parent / "loadshed",
+]
+for candidate in candidate_dirs:
+    if (candidate / "thermal_daemon.py").exists():
+        sys.path.insert(0, str(candidate))
+        break
+else:
+    raise SystemExit("Loadshed thermal modules not installed")
+
+from thermal_daemon import main  # noqa: E402
+
+
+raise SystemExit(main())

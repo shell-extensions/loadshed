@@ -278,6 +278,27 @@ class LoadshedHelperTests(unittest.TestCase):
         self.assertEqual(continued, [(123, "rsync", "42")])
         self.assertEqual(saved, [{"entries": {}}])
 
+    def test_thermal_enable_requires_calibration(self):
+        output = io.StringIO()
+
+        class UncalibratedPolicy:
+            @staticmethod
+            def load_config(path):
+                return {"target_c": None}
+
+        with (
+            mock.patch.object(sys, "argv", [str(HELPER_PATH), "thermal-enable"]),
+            mock.patch.object(helper, "require_root"),
+            mock.patch.object(helper, "load_thermal_policy_module", return_value=UncalibratedPolicy),
+            contextlib.redirect_stdout(output),
+        ):
+            result = helper.main()
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(payload["ok"])
+        self.assertIn("calibration is required", payload["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
