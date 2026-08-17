@@ -49,7 +49,7 @@ reemplaza un servicio mientras el botón de pausa está activo, solo se libera e
 servicios gestionados permanecen pausados.
 
 Ejecuta `./install.sh` después de actualizar la extensión para que el helper y las reglas sudoers
-incluyan los comandos de configuración y aplicación.
+incluyan los comandos de configuración y recuperación.
 
 Los usuarios avanzados pueden seguir editando `/etc/loadshed/units.json` como root. Las entradas
 integradas del catálogo están marcadas como opcionales, por lo que los servicios no instalados en la
@@ -90,6 +90,13 @@ actualización de paquete normal), el gate reajusta su protección al nuevo bina
 levantar la pausa. Si el gate no está disponible, los objetivos afectados siguen
 pausados mediante SIGSTOP/freeze, pero el estado informa de una pausa no estricta en
 lugar de una pausa estricta.
+
+Loadshed conserva el diario de pausa y recuperación propiedad de root en
+`/var/lib/loadshed`, por lo que reiniciar la extensión o GNOME Shell no pierde
+un thaw pendiente. Un servicio que ya estaba congelado antes de Loadshed se
+muestra como congelación externa y no se modifica automáticamente. Después de
+comprobar que está obsoleto, usa la acción de menú "Recover frozen targets" o
+ejecuta `sudo /usr/local/bin/loadshed-helper recover`.
 
 Los daemons de Snap son unidades systemd normales y también pueden añadirse aquí. Snap suele exponer
 un daemon como `snap.<snap-name>.<service-name>.service`. Usa el nombre exacto de la unidad mostrado
@@ -159,6 +166,7 @@ opción de bandeja o segundo plano.
 ```bash
 sudo /usr/local/bin/loadshed-helper status
 sudo /usr/local/bin/loadshed-helper resume
+sudo /usr/local/bin/loadshed-helper recover
 sudo /usr/local/bin/loadshed-helper config-get
 ```
 

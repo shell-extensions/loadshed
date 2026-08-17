@@ -194,6 +194,7 @@ class LoadshedToggle extends QuickSettings.QuickMenuToggle {
         this._itemsSection = new PopupMenu.PopupMenuSection();
         this.menu.addMenuItem(this._itemsSection);
         this.menu.addAction(_('Refresh'), () => this._refresh());
+        this.menu.addAction(_('Recover frozen targets'), () => this._runAction('recover'));
         this.menu.addAction(_('Settings'), () => this._openPreferences());
         this.menu.addAction(_('Setup help'), () => this._notifySetupRequired());
 
@@ -294,7 +295,9 @@ class LoadshedToggle extends QuickSettings.QuickMenuToggle {
         const preAction = Promise.resolve();
 
         this._busy = true;
-        this.subtitle = action === 'pause' ? _('Pausing') : _('Resuming');
+        this.subtitle = action === 'pause'
+            ? _('Pausing')
+            : action === 'recover' ? _('Recovering') : _('Resuming');
         preAction
             .then(() => this._manager.run(action))
             .then(status => this._applyStatus(status))
@@ -373,6 +376,8 @@ class LoadshedToggle extends QuickSettings.QuickMenuToggle {
                 ngettext('1 target protected', '%d targets protected', summary.protectedCount),
                 summary.protectedCount
             );
+        } else if (helperStatus.recovery_required || Number(helperStatus.external_frozen_count) > 0) {
+            this.subtitle = _('Recovery required');
         } else {
             this.subtitle = _('Nothing running');
         }

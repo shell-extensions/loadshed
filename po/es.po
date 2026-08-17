@@ -40,6 +40,10 @@ msgstr "Ajustes"
 msgid "Setup help"
 msgstr "Ayuda de configuración"
 
+#: extension.js
+msgid "Recover frozen targets"
+msgstr "Restaurar objetivos congelados"
+
 #: extension.js:236
 msgid "Refreshing"
 msgstr "Actualizando"
@@ -51,6 +55,14 @@ msgstr "Pausando"
 #: extension.js:257
 msgid "Resuming"
 msgstr "Reanudando"
+
+#: extension.js
+msgid "Recovering"
+msgstr "Restaurando"
+
+#: extension.js
+msgid "Recovery required"
+msgstr "Se requiere recuperación"
 
 #: extension.js:277 prefs.js:290 prefs.js:314 prefs.js:380 prefs.js:648
 #: prefs.js:924

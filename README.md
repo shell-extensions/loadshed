@@ -50,7 +50,7 @@ Disabling or replacing a service while the pause button is active releases only
 that service; the other managed services remain paused.
 
 Run `./install.sh` after updating the extension so the helper and sudoers rules
-include the configuration and enforce commands.
+include the configuration and recovery commands.
 
 Advanced users can still edit `/etc/loadshed/units.json` as root. Built-in
 catalog entries are marked optional, so services not installed on the machine are
@@ -90,6 +90,13 @@ outside this guarantee. Replacing the executable in place (a routine package
 upgrade) re-arms the gate on the new binary without dropping the pause. If
 the gate is unavailable, the affected targets are still paused through
 SIGSTOP/freeze, but status reports a non-strict pause instead of a hard one.
+
+Loadshed keeps the root pause/recovery journal under `/var/lib/loadshed`, so an
+extension or GNOME Shell restart cannot discard a pending thaw. A service that
+was already frozen before Loadshed touched it is shown as an external freeze
+and is not changed automatically. After verifying that such a freeze is stale,
+use the menu action "Recover frozen targets" or run
+`sudo /usr/local/bin/loadshed-helper recover`.
 
 Snap daemons are normal systemd units and can be added here too. For example,
 Snap usually exposes a daemon as `snap.<snap-name>.<service-name>.service`.
@@ -164,6 +171,7 @@ launcher or extra flags, for example a tray/background option.
 ```bash
 sudo /usr/local/bin/loadshed-helper status
 sudo /usr/local/bin/loadshed-helper resume
+sudo /usr/local/bin/loadshed-helper recover
 sudo /usr/local/bin/loadshed-helper config-get
 ```
 

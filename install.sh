@@ -29,6 +29,7 @@ GATE_UNIT_NAME="loadshed-gate.service"
 GATE_UNIT_PATH="/etc/systemd/system/${GATE_UNIT_NAME}"
 CONFIG_DIR="/etc/loadshed"
 CONFIG_PATH="${CONFIG_DIR}/units.json"
+STATE_DIR="/var/lib/loadshed"
 SUDOERS_FILE="/etc/sudoers.d/loadshed"
 LEGACY_CONFIG_PATH="/etc/service-pauser/units.json"
 LEGACY_SUDOERS_FILE="/etc/sudoers.d/service-pauser"
@@ -196,6 +197,12 @@ fi
 
 echo "Installing configuration directory ${CONFIG_DIR}"
 sudo install -d -o root -g root -m 0755 "${CONFIG_DIR}"
+echo "Installing durable Loadshed state directory ${STATE_DIR}"
+sudo install -d -o root -g root -m 0700 "${STATE_DIR}"
+if sudo test -e /run/loadshed/state.json && ! sudo test -e "${STATE_DIR}/state.json"; then
+  echo "Migrating existing runtime Loadshed state"
+  sudo install -o root -g root -m 0600 /run/loadshed/state.json "${STATE_DIR}/state.json"
+fi
 
 if sudo test -e "${CONFIG_PATH}"; then
   echo "Keeping existing ${CONFIG_PATH}"
@@ -210,7 +217,7 @@ else
 fi
 
 sudo tee "${SUDOERS_FILE}" >/dev/null <<EOF
-Cmnd_Alias LOADSHED_HELPER = ${HELPER_INSTALL_PATH} status, ${HELPER_INSTALL_PATH} pause, ${HELPER_INSTALL_PATH} resume, ${HELPER_INSTALL_PATH} toggle, ${HELPER_INSTALL_PATH} enforce, ${HELPER_INSTALL_PATH} config-get, ${HELPER_INSTALL_PATH} config-set, ${HELPER_INSTALL_PATH} catalog-status
+Cmnd_Alias LOADSHED_HELPER = ${HELPER_INSTALL_PATH} status, ${HELPER_INSTALL_PATH} pause, ${HELPER_INSTALL_PATH} resume, ${HELPER_INSTALL_PATH} toggle, ${HELPER_INSTALL_PATH} enforce, ${HELPER_INSTALL_PATH} recover, ${HELPER_INSTALL_PATH} config-get, ${HELPER_INSTALL_PATH} config-set, ${HELPER_INSTALL_PATH} catalog-status
 ${target_user} ALL=(root) NOPASSWD: LOADSHED_HELPER
 EOF
 

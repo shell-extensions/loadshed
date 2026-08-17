@@ -18,6 +18,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import errno
+import fcntl
 import json
 import os
 import re
@@ -28,14 +29,20 @@ import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 
 CONFIG_DIR = "/etc/loadshed"
 CONFIG_PATH = f"{CONFIG_DIR}/units.json"
-STATE_DIR = "/run/loadshed"
+RUNTIME_DIR = "/run/loadshed"
+STATE_DIR = "/var/lib/loadshed"
 STATE_PATH = f"{STATE_DIR}/state.json"
-GATE_SOCKET_PATH = f"{STATE_DIR}/gate.sock"
+LEGACY_STATE_PATH = f"{RUNTIME_DIR}/state.json"
+LOCK_PATH = f"{RUNTIME_DIR}/helper.lock"
+GATE_SOCKET_PATH = f"{RUNTIME_DIR}/gate.sock"
 CGROUP_ROOT = "/sys/fs/cgroup"
 GATE_TIMEOUT = 3.0
+STATE_VERSION = 2
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 
 # Legacy process names are accepted only as a migration input.  Resolution is
 # deliberately independent of PATH so a user-controlled environment cannot
@@ -54,6 +61,49 @@ class LoadshedError(Exception):
     pass
 
 
+def default_state():
+    return {
+        "version": STATE_VERSION,
+        "intent": "idle",
+        "paused": False,
+        "generation": 0,
+        "entries": {},
+        "gate": {},
+        "recovery_required": False,
+        "state_known": True,
+        "state_error": None,
+        "state_present": False,
+    }
+
+
+def current_boot_id():
+    try:
+        with open(BOOT_ID_PATH, "r", encoding="utf-8") as boot_file:
+            return boot_file.read().strip()
+    except OSError:
+        return None
+
+
+@contextmanager
+def helper_lock(shared=False):
+    """Serialize helper transitions so pause/resume cannot cross each other."""
+    os.makedirs(RUNTIME_DIR, mode=0o755, exist_ok=True)
+    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            os.chown(LOCK_PATH, 0, 0)
+            os.chmod(LOCK_PATH, 0o600)
+        except OSError:
+            pass
+        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def json_print(payload):
     print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
@@ -69,6 +119,10 @@ def fail(message, action="error"):
         "gate_active": False,
         "queued_exec_count": 0,
         "protected_count": 0,
+        "external_frozen_count": 0,
+        "recovery_required": True,
+        "resume_pending": False,
+        "state_error": message,
         "error": message,
         "entries": [],
         "errors": [message],
@@ -314,59 +368,120 @@ def enabled_units(units):
     return [unit for unit in units if unit_enabled(unit)]
 
 
-def load_state():
-    default = {"paused": False, "generation": 0, "entries": {}}
+def _read_state_file(path):
     try:
-        st = os.stat(STATE_PATH)
+        st = os.stat(path)
     except FileNotFoundError:
-        return default
+        return None
 
     if st.st_uid != 0 or (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
-        return default
+        raise LoadshedError(f"state must be root-owned and not group/world writable: {path}")
 
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as state_file:
+        with open(path, "r", encoding="utf-8") as state_file:
             state = json.load(state_file)
-    except (OSError, json.JSONDecodeError):
-        return default
-
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LoadshedError(f"state is unreadable or invalid: {path}") from exc
     if not isinstance(state, dict):
-        return default
-    entries = state.get("entries")
-    if not isinstance(entries, dict):
-        entries = {}
-    generation = state.get("generation", 0)
+        raise LoadshedError(f"state root must be an object: {path}")
+    return state
+
+
+def _normalize_state(raw):
+    state = default_state()
+    if raw is None:
+        return state
+    if not isinstance(raw, dict):
+        raise LoadshedError("state root must be an object")
+
+    generation = raw.get("generation", 0)
     if not isinstance(generation, int) or generation < 0:
-        generation = 0
-    return {
-        "paused": state.get("paused") is True,
+        raise LoadshedError("state generation is invalid")
+    entries = raw.get("entries", {})
+    if not isinstance(entries, dict):
+        raise LoadshedError("state entries must be an object")
+
+    intent = raw.get("intent")
+    if intent not in {"idle", "pausing", "paused", "resuming"}:
+        intent = "paused" if raw.get("paused") is True else "idle"
+    version = raw.get("version", 1)
+    if version not in {1, STATE_VERSION}:
+        raise LoadshedError(f"unsupported state version: {version!r}")
+    state.update({
+        "version": STATE_VERSION,
+        "intent": intent,
+        "paused": raw.get("paused") is True or intent in {"pausing", "paused", "resuming"},
         "generation": generation,
         "entries": entries,
-    }
+        "gate": raw.get("gate") if isinstance(raw.get("gate"), dict) else {},
+        "recovery_required": bool(raw.get("recovery_required")),
+        "state_present": True,
+    })
+    stored_boot_id = raw.get("boot_id")
+    boot_id = current_boot_id()
+    if stored_boot_id and boot_id and stored_boot_id != boot_id:
+        # cgroup freezes, SIGSTOP state, fanotify marks, and queued execs do
+        # not survive a full reboot.  Do not carry a stale pause intent into
+        # a new boot; the extension will see a clean, resumable state.
+        state.update({
+            "intent": "idle",
+            "paused": False,
+            "entries": {},
+            "gate": {},
+            "recovery_required": False,
+        })
+    state["boot_id"] = boot_id or stored_boot_id
+    return state
+
+
+def load_state():
+    """Load the durable state without turning corruption into a clean resume."""
+    try:
+        raw = _read_state_file(STATE_PATH)
+        if raw is None and LEGACY_STATE_PATH != STATE_PATH:
+            # The old release kept the state in /run.  Read it for one
+            # transition so an upgrade can finish an interrupted pause/resume
+            # safely.  The next save_state() writes the durable copy under
+            # /var/lib.
+            raw = _read_state_file(LEGACY_STATE_PATH)
+        return _normalize_state(raw)
+    except LoadshedError as exc:
+        state = default_state()
+        state["state_known"] = False
+        state["state_error"] = str(exc)
+        state["recovery_required"] = True
+        return state
 
 
 def save_state(state):
-    state = {
-        "paused": state.get("paused") is True,
-        "generation": state.get("generation", 0),
-        "entries": state.get("entries", {}),
-    }
-    entries = state.get("entries", {})
-    if not state["paused"] and not entries:
-        try:
-            os.unlink(STATE_PATH)
-        except FileNotFoundError:
-            pass
-        return
-
+    normalized = _normalize_state(state)
+    normalized["boot_id"] = normalized.get("boot_id") or current_boot_id()
+    normalized["state_present"] = True
+    normalized["updated_at"] = int(time.time())
     os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
-    state["updated_at"] = int(time.time())
-    tmp_path = f"{STATE_PATH}.tmp"
+    try:
+        os.chown(STATE_DIR, 0, 0)
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+
+    tmp_path = f"{STATE_PATH}.tmp.{os.getpid()}"
     with open(tmp_path, "w", encoding="utf-8") as state_file:
-        json.dump(state, state_file, sort_keys=True, separators=(",", ":"))
+        json.dump(normalized, state_file, sort_keys=True, separators=(",", ":"))
         state_file.write("\n")
-    os.chmod(tmp_path, 0o644)
+        state_file.flush()
+        os.fsync(state_file.fileno())
+    os.chown(tmp_path, 0, 0)
+    os.chmod(tmp_path, 0o600)
     os.replace(tmp_path, STATE_PATH)
+    try:
+        directory_fd = os.open(STATE_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        pass
 
 
 def gate_request(command, **fields):
@@ -447,6 +562,7 @@ def gate_status():
             "active": bool(response.get("active")),
             "queued_exec_count": int(response.get("queued_exec_count", 0)),
             "generation": response.get("generation"),
+            "targets": response.get("targets", []),
             "error": response.get("error"),
         }
     except (LoadshedError, ValueError, TypeError) as exc:
@@ -458,6 +574,7 @@ def gate_status():
             "active": False,
             "queued_exec_count": 0,
             "generation": None,
+            "targets": [],
             "error": str(exc),
         }
 
@@ -551,7 +668,11 @@ def catalog_status_payload(units):
         service_active = service_status.get("ActiveState") in ("active", "activating")
         timer_active = timer_status.get("ActiveState") == "active"
         managed_state = managed_state or {}
-        managed_active = bool(managed_state.get("service_frozen") or managed_state.get("timer_stopped"))
+        managed_active = bool(
+            entry_owns_service_freeze(managed_state) or
+            managed_state.get("timer_stopped") or
+            managed_state.get("timer_stop_pending")
+        )
         available = service_loaded and (not unit.get("timer") or timer_loaded)
 
         entries.append({
@@ -633,9 +754,29 @@ def set_cgroup_freeze(unit, frozen):
     raise LoadshedError(f"cgroup {action} timed out for {unit}")
 
 
+def service_frozen_from_status(status):
+    return (
+        status.get("FreezerState") == "frozen" or
+        cgroup_frozen_from_status(status)
+    )
+
+
+def service_freeze_state_known(status):
+    return (
+        unit_loaded(status) and
+        (status.get("FreezerState") in {"running", "frozen"} or
+         isinstance(status.get("ControlGroup"), str))
+    )
+
+
 def freeze_service(unit):
     result = systemctl(["freeze", unit])
     if result.returncode == 0:
+        status = show_unit(unit, include_freezer=True, extra_properties=["ControlGroup"])
+        if not service_freeze_state_known(status):
+            raise LoadshedError(f"could not verify freezer state after freezing {unit}")
+        if not service_frozen_from_status(status):
+            raise LoadshedError(f"systemctl freeze {unit} returned success but the cgroup is running")
         return "systemctl"
 
     detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
@@ -646,6 +787,11 @@ def freeze_service(unit):
             f"systemctl freeze {unit} failed: {detail}; fallback {exc}"
         ) from exc
 
+    status = show_unit(unit, include_freezer=True, extra_properties=["ControlGroup"])
+    if not service_freeze_state_known(status):
+        raise LoadshedError(f"could not verify freezer state after freezing {unit}")
+    if not service_frozen_from_status(status):
+        raise LoadshedError(f"cgroup freeze {unit} was not observed")
     return "cgroup"
 
 
@@ -655,6 +801,20 @@ def thaw_service(unit, method):
         return
 
     systemctl(["thaw", unit], check=True)
+
+
+def verify_service_thawed(unit):
+    status = show_unit(unit, include_freezer=True, extra_properties=["ControlGroup"])
+    if not service_freeze_state_known(status):
+        raise LoadshedError(f"could not verify freezer state after thawing {unit}")
+    if service_frozen_from_status(status):
+        raise LoadshedError(f"service remained frozen after thaw: {unit}")
+
+
+def entry_owns_service_freeze(entry_state):
+    # service_frozen is the field used by releases before the durable state
+    # format.  Treat it as owned while migrating old state.
+    return bool(entry_state.get("owned_frozen", entry_state.get("service_frozen")))
 
 
 def proc_stat_start_time(pid):
@@ -756,7 +916,18 @@ def continue_process(pid, executable, start_time):
         os.kill(pid, signal.SIGCONT)
 
 
-def pause_process(unit, entry_state, errors):
+def verify_process_continued(pid, executable, start_time):
+    if not process_is_same(pid, executable, start_time):
+        return
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if proc_state(pid) != "T":
+            return
+        time.sleep(0.05)
+    raise LoadshedError(f"process remained stopped after resume: {pid}")
+
+
+def pause_process(unit, entry_state, errors, persist=None):
     executable = unit["executable"]
     processes = {
         str(pid): proc
@@ -776,6 +947,11 @@ def pause_process(unit, entry_state, errors):
             "start_time": proc["start_time"],
             "executable": executable,
         }
+        entry_state["executable"] = executable
+        entry_state["processes"] = processes
+        entry_state["process_stopped"] = bool(processes)
+        if persist is not None:
+            persist(entry_state)
 
     entry_state["executable"] = executable
     entry_state["processes"] = processes
@@ -785,15 +961,21 @@ def pause_process(unit, entry_state, errors):
 
 def pause_units(units, new_pause=True):
     state = load_state()
+    if not state.get("state_known", True):
+        raise LoadshedError(state.get("state_error") or "Loadshed state requires recovery")
     entries = state.setdefault("entries", {})
     errors = []
 
     if new_pause or not state.get("paused"):
         state["paused"] = True
+        state["intent"] = "pausing"
         state["generation"] = int(state.get("generation", 0)) + 1
+        state["recovery_required"] = False
         save_state(state)
     else:
         state["paused"] = True
+        state["intent"] = "pausing"
+        save_state(state)
 
     try:
         gate = gate_configure(units, state["generation"])
@@ -805,6 +987,7 @@ def pause_units(units, new_pause=True):
         # paused) instead of leaving nothing paused at all.
         state["gate"] = {"healthy": False, "active": False, "error": str(exc)}
         errors.append(str(exc))
+    save_state(state)
 
     for unit in units:
         if optional_service_missing(unit, entries.get(unit["id"])):
@@ -816,18 +999,26 @@ def pause_units(units, new_pause=True):
                 "process_stopped": False,
                 "processes": {},
             })
-            entry_state = pause_process(unit, entry_state, errors)
+            def persist_process_entry(value):
+                entries[unit["id"]] = value
+                save_state(state)
+
+            entry_state = pause_process(unit, entry_state, errors, persist_process_entry)
             # Keep the entry even when no process exists.  It is the durable
             # pause intent that lets the gate catch a future direct exec.
             entries[unit["id"]] = entry_state
+            save_state(state)
             continue
 
         entry_state = entries.get(unit["id"], {
             "service": unit["service"],
             "timer": unit.get("timer"),
+            "owned_frozen": False,
             "service_frozen": False,
             "timer_stopped": False,
         })
+        if "owned_frozen" not in entry_state:
+            entry_state["owned_frozen"] = entry_owns_service_freeze(entry_state)
 
         try:
             timer = unit.get("timer")
@@ -836,8 +1027,18 @@ def pause_units(units, new_pause=True):
                 if not unit_loaded(timer_status) and not unit.get("optional"):
                     raise LoadshedError(f"timer not loaded: {timer}")
                 if unit_loaded(timer_status) and timer_status["ActiveState"] == "active":
+                    # Journal the intent before the stop.  If the helper is
+                    # interrupted after systemctl has acted but before the
+                    # completed entry is persisted, resume still knows that
+                    # this timer must be started again.
+                    entry_state["timer_stop_pending"] = True
+                    entries[unit["id"]] = entry_state
+                    save_state(state)
                     systemctl(["stop", timer], check=True)
                     entry_state["timer_stopped"] = True
+                    entry_state.pop("timer_stop_pending", None)
+                    entries[unit["id"]] = entry_state
+                    save_state(state)
 
             service_status = show_unit(unit["service"], include_freezer=True, extra_properties=["ControlGroup"])
             if not unit_loaded(service_status):
@@ -846,31 +1047,70 @@ def pause_units(units, new_pause=True):
                 raise LoadshedError(f"service not loaded: {unit['service']}")
 
             service_active = service_status["ActiveState"] in ("active", "activating")
-            service_frozen = (
-                service_status.get("FreezerState") == "frozen" or
-                cgroup_frozen_from_status(service_status)
-            )
+            service_frozen = service_frozen_from_status(service_status)
+            entry_state["control_group"] = service_status.get("ControlGroup")
 
-            if service_active and not service_frozen:
+            if service_frozen:
+                if entry_owns_service_freeze(entry_state):
+                    entry_state["owned_frozen"] = True
+                    entry_state["service_frozen"] = True
+                else:
+                    # Do not claim or thaw a cgroup that was already frozen
+                    # before this pause.  The explicit recovery action is
+                    # required when ownership cannot be proven anymore.
+                    entry_state["owned_frozen"] = False
+                    entry_state["service_frozen"] = False
+                    entry_state["preexisting_frozen"] = True
+                    entry_state.pop("freeze_method", None)
+            elif service_active:
                 entry_state["freeze_method"] = freeze_service(unit["service"])
+                entry_state["owned_frozen"] = True
                 entry_state["service_frozen"] = True
-            elif not service_active and not service_frozen and entry_state.get("service_frozen"):
+                entry_state.pop("preexisting_frozen", None)
+            elif not service_frozen and entry_owns_service_freeze(entry_state):
+                entry_state["owned_frozen"] = False
                 entry_state["service_frozen"] = False
                 entry_state.pop("freeze_method", None)
         except LoadshedError as exc:
             errors.append(f"{unit['label']}: {exc}")
+            if unit.get("service"):
+                try:
+                    failed_status = show_unit(
+                        unit["service"],
+                        include_freezer=True,
+                        extra_properties=["ControlGroup"],
+                    )
+                    if unit_loaded(failed_status) and service_frozen_from_status(failed_status):
+                        entry_state["owned_frozen"] = True
+                        entry_state["service_frozen"] = True
+                        entry_state["control_group"] = failed_status.get("ControlGroup")
+                        state["recovery_required"] = True
+                except LoadshedError:
+                    pass
 
-        if entry_state.get("service_frozen") or entry_state.get("timer_stopped"):
+        if (
+            entry_state.get("owned_frozen") or
+            entry_state.get("service_frozen") or
+            entry_state.get("timer_stopped") or
+            entry_state.get("timer_stop_pending") or
+            entry_state.get("preexisting_frozen")
+        ):
             entries[unit["id"]] = entry_state
         else:
             entries.pop(unit["id"], None)
+        save_state(state)
 
+    state["intent"] = "paused"
+    state["recovery_required"] = bool(errors)
     save_state(state)
     return errors
 
 
 def enforce_units(units):
-    if not load_state().get("paused"):
+    state = load_state()
+    if not state.get("state_known", True):
+        return [state.get("state_error") or "Loadshed state requires recovery"]
+    if not state.get("paused"):
         return []
     return pause_units(units, new_pause=False)
 
@@ -910,17 +1150,138 @@ def state_unit_from_entry(entry_id, entry_state, configured):
     }
 
 
+def _service_entry_from_status(unit, status):
+    return {
+        "service": unit["service"],
+        "timer": unit.get("timer"),
+        "control_group": status.get("ControlGroup"),
+        "owned_frozen": True,
+        "service_frozen": True,
+        "freeze_method": "systemctl",
+        "timer_stopped": False,
+        "recovery_adopted": True,
+    }
+
+
+def _process_entry_from_stopped(unit, processes):
+    stopped = [proc for proc in processes if proc.get("state") == "T"]
+    return {
+        "executable": unit["executable"],
+        "processes": {
+            str(proc["pid"]): {
+                "start_time": proc["start_time"],
+                "executable": unit["executable"],
+            }
+            for proc in stopped
+        },
+        "process_stopped": bool(stopped),
+        "recovery_adopted": True,
+    }
+
+
+def adopt_gate_recovery(state, units, gate):
+    """Rebuild only configured freezes while the root gate proves a pause."""
+    if not gate.get("active"):
+        return False
+    if state.get("state_known", True) and state.get("entries") and state.get("paused"):
+        return False
+
+    entries = state.setdefault("entries", {})
+    gate_executables = {
+        target.get("executable")
+        for target in gate.get("targets", [])
+        if isinstance(target, dict) and isinstance(target.get("executable"), str)
+    }
+    for unit in units:
+        if unit.get("executable"):
+            executable = normalize_executable_path(unit["executable"])
+            if executable not in gate_executables or not os.path.exists(executable):
+                continue
+            entries[unit["id"]] = _process_entry_from_stopped(
+                {**unit, "executable": executable}, find_processes(executable)
+            )
+            continue
+
+        status = show_unit(unit["service"], include_freezer=True, extra_properties=["ControlGroup"])
+        if unit_loaded(status) and service_frozen_from_status(status):
+            entries[unit["id"]] = _service_entry_from_status(unit, status)
+
+    state["state_known"] = True
+    state["state_error"] = None
+    state["paused"] = True
+    state["intent"] = "resuming"
+    gate_generation = gate.get("generation")
+    state["generation"] = gate_generation if gate_generation is not None else state.get("generation", 0)
+    state["recovery_required"] = True
+    save_state(state)
+    return True
+
+
+def adopt_external_freezes(state, units):
+    """Explicit recovery for orphaned configured freezes with no active gate."""
+    entries = state.setdefault("entries", {})
+    adopted = []
+    for unit in units:
+        existing = entries.get(unit["id"], {})
+        if unit.get("executable"):
+            if existing.get("process_stopped"):
+                continue
+            if not os.path.exists(unit["executable"]):
+                continue
+            processes = [
+                proc for proc in find_processes(unit["executable"])
+                if proc.get("state") == "T"
+            ]
+            if processes:
+                entries[unit["id"]] = _process_entry_from_stopped(unit, processes)
+                adopted.append(unit["id"])
+            continue
+
+        if entry_owns_service_freeze(existing):
+            continue
+        status = show_unit(unit["service"], include_freezer=True, extra_properties=["ControlGroup"])
+        if unit_loaded(status) and service_frozen_from_status(status):
+            entries[unit["id"]] = _service_entry_from_status(unit, status)
+            adopted.append(unit["id"])
+
+    state["state_known"] = True
+    state["state_error"] = None
+    state["paused"] = bool(adopted)
+    state["intent"] = "resuming" if adopted else "idle"
+    state["recovery_required"] = bool(adopted)
+    save_state(state)
+    return adopted
+
+
+def recover_units(units):
+    state = load_state()
+    gate = gate_status()
+    if gate.get("active"):
+        adopt_external_freezes(state, units)
+        return resume_units(units)
+    adopted = adopt_external_freezes(state, units)
+    if not adopted and not state.get("paused") and not state.get("entries"):
+        return []
+    return resume_units(units)
+
+
 def resume_units(units, entry_ids=None):
     state = load_state()
+    gate = gate_status()
+    if state.get("state_known", True) is False:
+        if not adopt_gate_recovery(state, units, gate):
+            return [state.get("state_error") or "Loadshed state requires recovery"]
+    elif gate.get("active") and (not state.get("paused") or not state.get("entries")):
+        adopt_gate_recovery(state, units, gate)
+
     entries = state.get("entries", {})
     configured = units_by_id(units)
     selected_ids = set(entries) if entry_ids is None else set(entry_ids)
     full_resume = entry_ids is None
-    remaining = {
-        entry_id: entry_state
-        for entry_id, entry_state in entries.items()
-        if entry_id not in selected_ids
-    }
+    # Keep unprocessed selected entries in the journal as well.  If the
+    # helper is interrupted halfway through a resume, the next invocation
+    # must still see every target that has not been verified yet.
+    remaining = dict(entries)
     errors = []
 
     for entry_id, entry_state in entries.items():
@@ -942,53 +1303,82 @@ def resume_units(units, entry_ids=None):
                 for pid, proc in (entry_state.get("processes") or {}).items():
                     try:
                         continue_process(int(pid), executable, str(proc.get("start_time")))
+                        verify_process_continued(int(pid), executable, str(proc.get("start_time")))
                     except OSError as exc:
                         if exc.errno != errno.ESRCH:
                             errors.append(f"{unit['label']}: process resume failed for {pid}: {exc}")
                             kept_processes[pid] = proc
+                    except LoadshedError as exc:
+                        errors.append(f"{unit['label']}: {exc}")
+                        kept_processes[pid] = proc
                 keep_state["processes"] = kept_processes
                 keep_state["process_stopped"] = bool(kept_processes)
 
-        if entry_state.get("service_frozen"):
+        if entry_owns_service_freeze(entry_state):
             try:
                 service_status = show_unit(unit["service"], include_freezer=True, extra_properties=["ControlGroup"])
-                service_frozen = (
-                    service_status.get("FreezerState") == "frozen" or
-                    cgroup_frozen_from_status(service_status)
-                )
+                service_frozen = service_frozen_from_status(service_status)
                 if service_frozen:
                     thaw_service(unit["service"], entry_state.get("freeze_method"))
+                    verify_service_thawed(unit["service"])
+                keep_state["owned_frozen"] = False
                 keep_state["service_frozen"] = False
                 keep_state.pop("freeze_method", None)
             except LoadshedError as exc:
                 errors.append(f"{unit['label']}: {exc}")
+        else:
+            # A pre-existing/external freeze is intentionally not changed by
+            # normal resume.  It remains visible as external_frozen.
+            keep_state.pop("preexisting_frozen", None)
 
-        if entry_state.get("timer_stopped") and unit.get("timer"):
+        if (
+            (entry_state.get("timer_stopped") or entry_state.get("timer_stop_pending"))
+            and unit.get("timer")
+        ):
             try:
                 systemctl(["start", unit["timer"]], check=True)
                 keep_state["timer_stopped"] = False
+                keep_state.pop("timer_stop_pending", None)
             except LoadshedError as exc:
                 errors.append(f"{unit['label']}: {exc}")
 
-        if keep_state.get("service_frozen") or keep_state.get("timer_stopped"):
+        if (
+            entry_owns_service_freeze(keep_state) or
+            keep_state.get("timer_stopped") or
+            keep_state.get("timer_stop_pending")
+        ):
             remaining[entry_id] = keep_state
         elif keep_state.get("process_stopped"):
             remaining[entry_id] = keep_state
+        else:
+            remaining.pop(entry_id, None)
+        state["entries"] = remaining
+        save_state(state)
 
     state["entries"] = remaining
+    state["intent"] = "paused" if not full_resume and not errors else "resuming"
     save_state(state)
 
     if full_resume and not remaining:
         try:
             gate = gate_release(state.get("generation", 0))
             state["paused"] = False
+            state["intent"] = "idle"
+            state["recovery_required"] = False
             state["gate"] = gate
             save_state(state)
         except LoadshedError as exc:
             errors.append(str(exc))
             state["paused"] = True
+            state["intent"] = "resuming"
+            state["recovery_required"] = True
             state["gate"] = {"healthy": False, "active": True, "error": str(exc)}
             save_state(state)
+    elif errors:
+        state["paused"] = True
+        state["intent"] = "resuming"
+        state["recovery_required"] = True
+        save_state(state)
     return errors
 
 
@@ -1065,11 +1455,32 @@ def status_payload(units, action, errors=None):
         if entry.get("service_active") and not entry.get("paused") and not entry.get("external_frozen")
     )
     protected_count = sum(1 for entry in entries if entry.get("protected"))
+    external_frozen_count = sum(1 for entry in entries if entry.get("external_frozen"))
+    intent = state.get("intent")
+    if intent not in {"idle", "pausing", "paused", "resuming"}:
+        intent = "paused" if state.get("paused") else "idle"
     errors = list(errors or [])
+    state_present = state.get("state_present", True)
+    pause_state_known = bool(
+        state.get("state_known", True) and
+        (state_present or (gate["healthy"] and not gate["active"]))
+    )
+    if not state.get("state_known", True):
+        errors.append(state.get("state_error") or "Loadshed state requires recovery")
+    elif not state_present and not pause_state_known:
+        errors.append("Loadshed state journal is missing while gate state is not provably idle")
+    if state.get("recovery_required") and state.get("state_known", True):
+        errors.append("Loadshed recovery is required before normal operation")
+    if intent in {"pausing", "resuming"}:
+        errors.append("Loadshed transition is still pending")
+    if external_frozen_count:
+        errors.append("configured targets have external freezes; explicit recovery is required")
     if not gate["healthy"]:
         errors.append(gate["error"] or "loadshed-gate is unhealthy")
     elif state.get("paused") and not gate["active"]:
         errors.append("loadshed-gate is inactive while a pause intent is active")
+    elif gate["active"] and not state.get("paused"):
+        errors.append("loadshed-gate is active while no pause intent is recorded")
     generation_matches = (
         gate.get("generation") is None or
         gate.get("generation") == state.get("generation")
@@ -1080,7 +1491,17 @@ def status_payload(units, action, errors=None):
             f"state={state.get('generation')}"
         )
     strict_paused = bool(
-        state.get("paused") and gate["healthy"] and gate["active"] and generation_matches
+        state.get("paused") and pause_state_known and
+        intent == "paused" and not state.get("recovery_required") and
+        external_frozen_count == 0 and
+        gate["healthy"] and gate["active"] and generation_matches
+    )
+    recovery_required = bool(
+        state.get("recovery_required") or
+        not pause_state_known or
+        intent in {"pausing", "resuming"} or
+        external_frozen_count > 0 or
+        (gate.get("active") and not state.get("paused"))
     )
 
     return {
@@ -1088,14 +1509,18 @@ def status_payload(units, action, errors=None):
         "action": action,
         "paused": strict_paused,
         "pause_intent": bool(state.get("paused")),
-        "pause_state_known": True,
+        "pause_state_known": pause_state_known,
         "gate_healthy": gate["healthy"],
         "gate_active": gate["active"],
         "queued_exec_count": gate["queued_exec_count"],
         "gate_error": gate["error"],
+        "state_error": state.get("state_error"),
+        "recovery_required": recovery_required,
+        "resume_pending": intent == "resuming",
         "paused_count": paused_count,
         "running_count": running_count,
         "protected_count": protected_count,
+        "external_frozen_count": external_frozen_count,
         "entries": entries,
         "errors": errors,
     }
@@ -1118,8 +1543,10 @@ def status_entry(unit, managed_state):
     cgroup_frozen = cgroup_frozen_from_status(service_status)
     service_frozen = service_status.get("FreezerState") == "frozen" or cgroup_frozen
     timer_active = timer_status.get("ActiveState") in ("active", "activating")
-    managed_service_frozen = bool(managed_state.get("service_frozen"))
-    managed_timer_stopped = bool(managed_state.get("timer_stopped"))
+    managed_service_frozen = entry_owns_service_freeze(managed_state)
+    managed_timer_stopped = bool(
+        managed_state.get("timer_stopped") or managed_state.get("timer_stop_pending")
+    )
     service_pause_effective = managed_service_frozen and service_frozen
     timer_pause_effective = managed_timer_stopped and unit_loaded(timer_status) and not timer_active
     paused = service_pause_effective or timer_pause_effective
@@ -1147,6 +1574,7 @@ def status_entry(unit, managed_state):
         "managed_service_frozen": managed_service_frozen,
         "managed_timer_stopped": managed_timer_stopped,
         "freeze_method": managed_state.get("freeze_method"),
+        "freeze_owner": "loadshed" if service_pause_effective else ("external" if service_frozen else None),
         "external_frozen": service_frozen and not managed_service_frozen,
         "error": error,
     }
@@ -1185,6 +1613,7 @@ def process_status_entry(unit, managed_state):
         "stopped_process_count": len(stopped_processes),
         "managed": bool(managed_state.get("process_stopped")) or protected,
         "paused": paused,
+        "freeze_owner": "loadshed" if process_stopped else None,
         "managed_process_stopped": bool(managed_state.get("process_stopped")) and process_stopped,
         "error": None if executable_exists else f"executable not found: {unit['executable']}",
     }
@@ -1192,74 +1621,86 @@ def process_status_entry(unit, managed_state):
 
 def main():
     action = sys.argv[1] if len(sys.argv) == 2 else None
-    valid_actions = {"status", "pause", "resume", "toggle", "enforce", "config-get", "config-set", "catalog-status"}
+    valid_actions = {
+        "status", "pause", "resume", "toggle", "enforce", "recover",
+        "config-get", "config-set", "catalog-status",
+    }
     if action not in valid_actions:
-        return fail("usage: loadshed-helper status|pause|resume|toggle|enforce|config-get|config-set|catalog-status")
+        return fail("usage: loadshed-helper status|pause|resume|toggle|enforce|recover|config-get|config-set|catalog-status")
 
     try:
         require_root()
 
-        if action == "config-get":
-            json_print(config_payload(action, load_units()))
-            return 0
+        with helper_lock(shared=action in {"status", "catalog-status"}):
+            if action == "config-get":
+                json_print(config_payload(action, load_units()))
+                return 0
 
-        if action == "catalog-status":
-            require_systemctl()
-            raw_catalog = sys.stdin.read()
-            units = validate_units(json.loads(raw_catalog)) if raw_catalog.strip() else load_units()
-            json_print(catalog_status_payload(units))
-            return 0
+            if action == "catalog-status":
+                require_systemctl()
+                raw_catalog = sys.stdin.read()
+                units = validate_units(json.loads(raw_catalog)) if raw_catalog.strip() else load_units()
+                json_print(catalog_status_payload(units))
+                return 0
 
-        if action == "config-set":
-            raw_config = sys.stdin.read()
-            if not raw_config.strip():
-                raise LoadshedError("empty configuration")
-            old_units = load_units()
-            units = validate_units(json.loads(raw_config))
-            require_systemctl()
-            was_paused = bool(load_state().get("paused"))
-            errors = reconcile_config_state(old_units, units)
-            if errors:
+            if action == "config-set":
+                raw_config = sys.stdin.read()
+                if not raw_config.strip():
+                    raise LoadshedError("empty configuration")
+                old_units = load_units()
+                units = validate_units(json.loads(raw_config))
+                require_systemctl()
+                current_state = load_state()
+                if not current_state.get("state_known", True):
+                    raise LoadshedError(
+                        current_state.get("state_error") or
+                        "Loadshed state requires recovery before configuration changes"
+                    )
+                was_paused = bool(current_state.get("paused"))
+                errors = reconcile_config_state(old_units, units)
+                if errors:
+                    if was_paused:
+                        errors.extend(pause_units(enabled_units(old_units), new_pause=False))
+                    payload = config_payload(action, old_units)
+                    payload["ok"] = False
+                    payload["errors"] = errors
+                    json_print(payload)
+                    return 1
+
+                save_units_config(units)
                 if was_paused:
-                    errors.extend(pause_units(enabled_units(old_units), new_pause=False))
-                payload = config_payload(action, old_units)
-                payload["ok"] = False
+                    errors = pause_units(enabled_units(units), new_pause=False)
+
+                payload = config_payload(action, units)
+                payload["ok"] = not errors
                 payload["errors"] = errors
                 json_print(payload)
-                return 1
+                return 0 if payload["ok"] else 1
 
-            save_units_config(units)
-            if was_paused:
-                errors = pause_units(enabled_units(units), new_pause=False)
+            require_systemctl()
+            units = load_units()
+            active_units = enabled_units(units)
 
-            payload = config_payload(action, units)
-            payload["ok"] = not errors
-            payload["errors"] = errors
+            errors = []
+            if action == "pause":
+                errors = pause_units(active_units)
+            elif action == "resume":
+                errors = resume_units(units)
+            elif action == "enforce":
+                errors = enforce_units(active_units)
+            elif action == "recover":
+                errors = recover_units(units)
+            elif action == "toggle":
+                if load_state().get("paused"):
+                    errors = resume_units(units)
+                    action = "resume"
+                else:
+                    errors = pause_units(active_units)
+                    action = "pause"
+
+            payload = status_payload(units, action, errors)
             json_print(payload)
             return 0 if payload["ok"] else 1
-
-        require_systemctl()
-        units = load_units()
-        active_units = enabled_units(units)
-
-        errors = []
-        if action == "pause":
-            errors = pause_units(active_units)
-        elif action == "resume":
-            errors = resume_units(units)
-        elif action == "enforce":
-            errors = enforce_units(active_units)
-        elif action == "toggle":
-            if load_state().get("paused"):
-                errors = resume_units(units)
-                action = "resume"
-            else:
-                errors = pause_units(active_units)
-                action = "pause"
-
-        payload = status_payload(units, action, errors)
-        json_print(payload)
-        return 0 if payload["ok"] else 1
     except (OSError, json.JSONDecodeError, LoadshedError) as exc:
         return fail(str(exc), action=action)
 

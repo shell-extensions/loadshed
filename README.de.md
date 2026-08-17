@@ -49,7 +49,7 @@ werden. Wird ein Dienst deaktiviert oder ersetzt, während der Pause-Schalter ak
 dieser Dienst freigegeben; die anderen verwalteten Dienste bleiben pausiert.
 
 Führe nach einer Aktualisierung der Erweiterung `./install.sh` aus, damit Helper und sudoers-Regeln
-die Konfigurations- und Erzwingungsbefehle enthalten.
+die Konfigurations- und Recovery-Befehle enthalten.
 
 Fortgeschrittene Nutzer können `/etc/loadshed/units.json` weiterhin als root direkt bearbeiten.
 Eingebaute Katalogeinträge sind als optional markiert, sodass nicht installierte Dienste auf der
@@ -90,6 +90,13 @@ Paket-Update), stellt der Gate seinen Schutz auf die neue Datei um, ohne die Pau
 aufzuheben. Ist der Gate nicht erreichbar, bleiben die betroffenen Ziele weiterhin über
 SIGSTOP/Freeze pausiert, aber der Status meldet eine nicht-strikte statt einer harten
 Pause.
+
+Loadshed führt das root-eigene Pause-/Recovery-Journal unter `/var/lib/loadshed`,
+damit ein Neustart der Erweiterung oder der GNOME-Shell keinen offenen Thaw verliert.
+Ein Dienst, der bereits vor Loadshed eingefroren war, wird als externer Freeze
+angezeigt und nicht automatisch verändert. Nach Prüfung kann er über die
+Menüaktion „Eingefrorene Ziele wiederherstellen“ oder mit
+`sudo /usr/local/bin/loadshed-helper recover` freigegeben werden.
 
 Snap-Daemons sind normale systemd-Units und können hier ebenfalls hinzugefügt werden. Snap stellt
 einen Daemon normalerweise als `snap.<snap-name>.<service-name>.service` bereit. Verwende den exakten
@@ -159,6 +166,7 @@ Launcher oder zusätzliche Flags benötigt, zum Beispiel eine Tray-/Hintergrundo
 ```bash
 sudo /usr/local/bin/loadshed-helper status
 sudo /usr/local/bin/loadshed-helper resume
+sudo /usr/local/bin/loadshed-helper recover
 sudo /usr/local/bin/loadshed-helper config-get
 ```
 

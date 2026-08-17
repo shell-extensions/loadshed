@@ -49,6 +49,228 @@ def state_entry(entry_id, service=None, timer=None):
 
 
 class LoadshedHelperTests(unittest.TestCase):
+    def test_state_file_is_retained_after_verified_idle_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_dir = Path(directory) / "state-dir"
+            real_stat = helper.os.stat
+            fake_state_stat = type("Stat", (), {"st_uid": 0, "st_mode": 0o100600})()
+
+            def stat(path):
+                return fake_state_stat if str(path) == str(state_path) else real_stat(path)
+
+            with (
+                mock.patch.object(helper, "STATE_PATH", str(state_path)),
+                mock.patch.object(helper, "STATE_DIR", str(state_dir)),
+                mock.patch.object(helper.os, "chown"),
+                mock.patch.object(helper.os, "stat", side_effect=stat),
+            ):
+                helper.save_state({"paused": False, "generation": 4, "entries": {}})
+                state = helper.load_state()
+
+            self.assertTrue(state_path.exists())
+            self.assertEqual(state["generation"], 4)
+            self.assertFalse(state["paused"])
+
+    def test_invalid_state_is_not_treated_as_clean_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text("not-json")
+            real_stat = helper.os.stat
+            fake_state_stat = type("Stat", (), {"st_uid": 0, "st_mode": 0o100600})()
+
+            def stat(path):
+                return fake_state_stat if str(path) == str(state_path) else real_stat(path)
+
+            with (
+                mock.patch.object(helper, "STATE_PATH", str(state_path)),
+                mock.patch.object(helper, "LEGACY_STATE_PATH", str(state_path) + ".legacy"),
+                mock.patch.object(helper.os, "stat", side_effect=stat),
+            ):
+                state = helper.load_state()
+
+        self.assertFalse(state["state_known"])
+        self.assertTrue(state["recovery_required"])
+        self.assertIn("invalid", state["state_error"])
+
+    def test_state_from_previous_boot_is_reset_cleanly(self):
+        with mock.patch.object(helper, "current_boot_id", return_value="boot-new"):
+            state = helper._normalize_state({
+                "version": 2,
+                "boot_id": "boot-old",
+                "paused": True,
+                "intent": "paused",
+                "generation": 8,
+                "entries": {"alpha": state_entry("alpha")},
+            })
+
+        self.assertFalse(state["paused"])
+        self.assertEqual(state["intent"], "idle")
+        self.assertEqual(state["entries"], {})
+
+    def test_pause_does_not_claim_preexisting_service_freeze(self):
+        current_state = {"paused": False, "generation": 0, "entries": {}}
+        saved = []
+        frozen_status = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "FreezerState": "frozen",
+            "ControlGroup": "/system.slice/alpha.service",
+        }
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "save_state", side_effect=saved.append),
+            mock.patch.object(helper, "gate_configure", return_value={"healthy": True, "active": True}),
+            mock.patch.object(helper, "show_unit", return_value=frozen_status),
+            mock.patch.object(helper, "cgroup_frozen_from_status", return_value=False),
+        ):
+            errors = helper.pause_units([unit("alpha")])
+
+        self.assertEqual(errors, [])
+        entry = saved[-1]["entries"]["alpha"]
+        self.assertFalse(entry["owned_frozen"])
+        self.assertTrue(entry["preexisting_frozen"])
+
+    def test_resume_failure_keeps_owned_freeze_for_retry(self):
+        current_state = {
+            "paused": True,
+            "generation": 2,
+            "entries": {
+                "alpha": {
+                    "service": "alpha.service",
+                    "owned_frozen": True,
+                    "service_frozen": True,
+                    "freeze_method": "systemctl",
+                }
+            },
+        }
+        saved = []
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "save_state", side_effect=saved.append),
+            mock.patch.object(helper, "gate_status", return_value={
+                "healthy": True,
+                "active": True,
+                "generation": 2,
+                "queued_exec_count": 0,
+                "targets": [],
+                "error": None,
+            }),
+            mock.patch.object(helper, "show_unit", return_value={"FreezerState": "frozen"}),
+            mock.patch.object(helper, "cgroup_frozen_from_status", return_value=False),
+            mock.patch.object(helper, "thaw_service", side_effect=helper.LoadshedError("thaw failed")),
+        ):
+            errors = helper.resume_units([unit("alpha")])
+
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(saved[-1]["paused"])
+        self.assertEqual(saved[-1]["intent"], "resuming")
+        self.assertIn("alpha", saved[-1]["entries"])
+
+    def test_resume_adopts_configured_freezes_when_gate_proves_pause(self):
+        current_state = {"paused": True, "generation": 0, "entries": {}}
+        saved = []
+        frozen_status = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "FreezerState": "frozen",
+            "ControlGroup": "/system.slice/alpha.service",
+        }
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "save_state", side_effect=saved.append),
+            mock.patch.object(helper, "gate_status", return_value={
+                "healthy": True,
+                "active": True,
+                "generation": 7,
+                "queued_exec_count": 0,
+                "targets": [],
+                "error": None,
+            }),
+            mock.patch.object(helper, "show_unit", return_value=frozen_status),
+            mock.patch.object(helper, "cgroup_frozen_from_status", return_value=False),
+            mock.patch.object(helper, "thaw_service"),
+            mock.patch.object(helper, "verify_service_thawed"),
+            mock.patch.object(helper, "gate_release", return_value={"healthy": True, "active": False}),
+        ):
+            errors = helper.resume_units([unit("alpha")])
+
+        self.assertEqual(errors, [])
+        self.assertFalse(saved[-1]["paused"])
+        self.assertEqual(saved[-1]["generation"], 7)
+
+    def test_resume_recovers_when_state_says_idle_but_gate_is_active(self):
+        current_state = {"paused": False, "generation": 0, "entries": {}}
+        saved = []
+        frozen_status = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "FreezerState": "frozen",
+            "ControlGroup": "/system.slice/alpha.service",
+        }
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "save_state", side_effect=saved.append),
+            mock.patch.object(helper, "gate_status", return_value={
+                "healthy": True,
+                "active": True,
+                "generation": 9,
+                "queued_exec_count": 0,
+                "targets": [],
+                "error": None,
+            }),
+            mock.patch.object(helper, "show_unit", return_value=frozen_status),
+            mock.patch.object(helper, "cgroup_frozen_from_status", return_value=False),
+            mock.patch.object(helper, "thaw_service"),
+            mock.patch.object(helper, "verify_service_thawed"),
+            mock.patch.object(helper, "gate_release", return_value={"healthy": True, "active": False}),
+        ):
+            errors = helper.resume_units([unit("alpha")])
+
+        self.assertEqual(errors, [])
+        self.assertFalse(saved[-1]["paused"])
+        self.assertEqual(saved[-1]["generation"], 9)
+
+    def test_explicit_recover_adopts_external_service_freeze(self):
+        current_state = {"paused": False, "generation": 3, "entries": {}}
+        saved = []
+        frozen_status = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "FreezerState": "frozen",
+            "ControlGroup": "/system.slice/alpha.service",
+        }
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "save_state", side_effect=saved.append),
+            mock.patch.object(helper, "gate_status", return_value={
+                "healthy": True,
+                "active": False,
+                "generation": 3,
+                "queued_exec_count": 0,
+                "targets": [],
+                "error": None,
+            }),
+            mock.patch.object(helper, "show_unit", return_value=frozen_status),
+            mock.patch.object(helper, "cgroup_frozen_from_status", return_value=False),
+            mock.patch.object(helper, "thaw_service"),
+            mock.patch.object(helper, "verify_service_thawed"),
+            mock.patch.object(helper, "gate_release", return_value={"healthy": True, "active": False}),
+        ):
+            errors = helper.recover_units([unit("alpha")])
+
+        self.assertEqual(errors, [])
+        self.assertFalse(saved[-1]["paused"])
+
     def test_serialize_units_preserves_disabled_flag_only_when_false(self):
         serialized = helper.serialize_units([unit("active"), unit("disabled", enabled=False)])
 
@@ -73,6 +295,7 @@ class LoadshedHelperTests(unittest.TestCase):
             mock.patch.object(helper, "show_unit", return_value={"FreezerState": "frozen"}),
             mock.patch.object(helper, "cgroup_frozen_from_status", return_value=False),
             mock.patch.object(helper, "thaw_service", side_effect=lambda name, method: thawed.append(name)),
+            mock.patch.object(helper, "verify_service_thawed"),
         ):
             errors = helper.resume_units([unit("alpha"), unit("beta")], {"alpha"})
 
@@ -262,6 +485,7 @@ class LoadshedHelperTests(unittest.TestCase):
             mock.patch.object(helper, "require_systemctl"),
             mock.patch.object(helper, "load_units", return_value=old_units),
             mock.patch.object(helper, "load_state", return_value={"paused": True, "generation": 1, "entries": {"alpha": state_entry("alpha")}}),
+            mock.patch.object(helper, "helper_lock", return_value=contextlib.nullcontext()),
             mock.patch.object(helper, "reconcile_config_state", return_value=["release failed"]),
             mock.patch.object(helper, "pause_units", return_value=[]) as pause_units,
             mock.patch.object(helper, "save_units_config") as save_config,
@@ -311,6 +535,74 @@ class LoadshedHelperTests(unittest.TestCase):
         self.assertEqual(systemctl_calls, [["stop", "alpha.timer"]])
         self.assertTrue(saved[0]["entries"]["alpha"]["timer_stopped"])
 
+    def test_timer_stop_is_journaled_before_side_effect_and_resumed_from_pending(self):
+        current_state = {"paused": False, "generation": 0, "entries": {}}
+        saved = []
+        systemctl_calls = []
+
+        def show_unit(name, include_freezer=False, extra_properties=None):
+            if name == "alpha.timer":
+                return {"LoadState": "loaded", "ActiveState": "active", "SubState": "waiting"}
+            return {"LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead", "FreezerState": "running"}
+
+        def systemctl_call(args, check=False):
+            systemctl_calls.append(args)
+            return None
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(
+                helper,
+                "save_state",
+                side_effect=lambda state: saved.append(json.loads(json.dumps(state))),
+            ),
+            mock.patch.object(helper, "gate_configure", return_value={"healthy": True, "active": True}),
+            mock.patch.object(helper, "show_unit", side_effect=show_unit),
+            mock.patch.object(helper, "cgroup_frozen_from_status", return_value=False),
+            mock.patch.object(helper, "systemctl", side_effect=systemctl_call),
+        ):
+            self.assertEqual(helper.pause_units([unit("alpha", timer="alpha.timer")]), [])
+
+        self.assertEqual(systemctl_calls, [["stop", "alpha.timer"]])
+        pending_snapshot = next(
+            state for state in saved
+            if state["entries"].get("alpha", {}).get("timer_stop_pending")
+        )
+        self.assertTrue(pending_snapshot["entries"]["alpha"]["timer_stop_pending"])
+        self.assertNotIn("timer_stop_pending", saved[-1]["entries"]["alpha"])
+
+        resume_state = {
+            "paused": True,
+            "generation": 1,
+            "entries": {
+                "alpha": {
+                    "service": "alpha.service",
+                    "timer": "alpha.timer",
+                    "timer_stop_pending": True,
+                    "timer_stopped": False,
+                }
+            },
+        }
+        resume_calls = []
+        with (
+            mock.patch.object(helper, "load_state", return_value=resume_state),
+            mock.patch.object(helper, "gate_status", return_value={
+                "healthy": True,
+                "active": True,
+                "generation": 1,
+                "queued_exec_count": 0,
+                "targets": [],
+                "error": None,
+            }),
+            mock.patch.object(helper, "show_unit", side_effect=show_unit),
+            mock.patch.object(helper, "systemctl", side_effect=lambda args, check=False: resume_calls.append(args)),
+            mock.patch.object(helper, "save_state"),
+            mock.patch.object(helper, "gate_release", return_value={"healthy": True, "active": False}),
+        ):
+            self.assertEqual(helper.resume_units([unit("alpha", timer="alpha.timer")]), [])
+
+        self.assertIn(["start", "alpha.timer"], resume_calls)
+
     def test_config_set_reapplies_pause_after_successful_save(self):
         old_units = [unit("alpha")]
         new_units = [unit("alpha"), unit("beta")]
@@ -323,6 +615,7 @@ class LoadshedHelperTests(unittest.TestCase):
             mock.patch.object(helper, "require_systemctl"),
             mock.patch.object(helper, "load_units", return_value=old_units),
             mock.patch.object(helper, "load_state", return_value={"paused": True, "generation": 1, "entries": {"alpha": state_entry("alpha")}}),
+            mock.patch.object(helper, "helper_lock", return_value=contextlib.nullcontext()),
             mock.patch.object(helper, "reconcile_config_state", return_value=[]),
             mock.patch.object(helper, "save_units_config") as save_config,
             mock.patch.object(helper, "pause_units", return_value=[]) as pause_units,
@@ -333,6 +626,31 @@ class LoadshedHelperTests(unittest.TestCase):
         self.assertEqual(result, 0)
         save_config.assert_called_once_with(new_units)
         pause_units.assert_called_once_with(new_units, new_pause=False)
+
+    def test_config_set_refuses_unknown_pause_state(self):
+        output = io.StringIO()
+        requested = helper.serialize_units([unit("alpha")])
+
+        with (
+            mock.patch.object(sys, "argv", [str(HELPER_PATH), "config-set"]),
+            mock.patch.object(sys, "stdin", io.StringIO(json.dumps(requested))),
+            mock.patch.object(helper, "require_root"),
+            mock.patch.object(helper, "require_systemctl"),
+            mock.patch.object(helper, "load_units", return_value=[unit("alpha")]),
+            mock.patch.object(helper, "load_state", return_value={
+                "state_known": False,
+                "state_error": "state is corrupt",
+            }),
+            mock.patch.object(helper, "helper_lock", return_value=contextlib.nullcontext()),
+            mock.patch.object(helper, "save_units_config") as save_config,
+            contextlib.redirect_stdout(output),
+        ):
+            result = helper.main()
+
+        self.assertEqual(result, 1)
+        self.assertFalse(json.loads(output.getvalue())["ok"])
+        self.assertIn("state is corrupt", output.getvalue())
+        save_config.assert_not_called()
 
     def test_legacy_process_entry_migrates_and_serializes(self):
         entries = helper.validate_units([{
@@ -575,6 +893,107 @@ class LoadshedHelperTests(unittest.TestCase):
         self.assertFalse(payload["paused"])
         self.assertFalse(payload["gate_healthy"])
         self.assertIn("gate offline", payload["errors"])
+
+    def test_status_reports_gate_active_without_pause_state(self):
+        current_state = {"paused": False, "generation": 4, "entries": {}}
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "gate_status", return_value={
+                "healthy": True,
+                "active": True,
+                "generation": 4,
+                "queued_exec_count": 0,
+                "targets": [],
+                "error": None,
+            }),
+        ):
+            payload = helper.status_payload([], "status")
+
+        self.assertFalse(payload["paused"])
+        self.assertTrue(payload["recovery_required"])
+        self.assertIn("no pause intent", payload["errors"][0])
+
+    def test_status_keeps_missing_journal_unknown_while_gate_is_active(self):
+        current_state = {
+            "state_known": True,
+            "state_present": False,
+            "paused": False,
+            "generation": 4,
+            "entries": {},
+        }
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "gate_status", return_value={
+                "healthy": True,
+                "active": True,
+                "queued_exec_count": 0,
+                "generation": 4,
+                "targets": [],
+                "error": None,
+            }),
+        ):
+            payload = helper.status_payload([], "status")
+
+        self.assertFalse(payload["pause_state_known"])
+        self.assertTrue(payload["recovery_required"])
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("journal is missing" in error for error in payload["errors"]))
+
+    def test_status_does_not_release_session_targets_when_state_is_unknown(self):
+        current_state = {
+            "state_known": False,
+            "state_error": "state is corrupt",
+            "recovery_required": True,
+            "paused": False,
+            "generation": 4,
+            "entries": {},
+        }
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "gate_status", return_value={
+                "healthy": True,
+                "active": False,
+                "queued_exec_count": 0,
+                "generation": 4,
+                "targets": [],
+                "error": None,
+            }),
+        ):
+            payload = helper.status_payload([], "status")
+
+        self.assertFalse(payload["pause_state_known"])
+        self.assertTrue(payload["recovery_required"])
+        self.assertFalse(payload["ok"])
+        self.assertIn("state is corrupt", payload["errors"])
+
+    def test_status_reports_pending_resume_as_error(self):
+        current_state = {
+            "state_known": True,
+            "recovery_required": True,
+            "intent": "resuming",
+            "paused": True,
+            "generation": 4,
+            "entries": {},
+        }
+
+        with (
+            mock.patch.object(helper, "load_state", return_value=current_state),
+            mock.patch.object(helper, "gate_status", return_value={
+                "healthy": True,
+                "active": True,
+                "queued_exec_count": 0,
+                "generation": 4,
+                "targets": [],
+                "error": None,
+            }),
+        ):
+            payload = helper.status_payload([], "status")
+
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["resume_pending"])
+        self.assertTrue(any("transition is still pending" in error for error in payload["errors"]))
 
 
 if __name__ == "__main__":
